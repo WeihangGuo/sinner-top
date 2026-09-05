@@ -1,0 +1,1082 @@
+#!/usr/bin/env python3
+"""Interactive view of Slurm GPU availability and ownership.
+
+Running and pending jobs appear side by side, grouped by user and ordered by
+earliest finish. Pending jobs include Slurm's estimated start countdown when
+available, plus their runtime limit. Array tasks are counted individually and
+displayed with their task IDs.
+
+In a terminal, use arrows or hjkl to choose a pane and scroll. Press [ or ] to
+cycle through all GPU types discovered from Slurm (g also advances), or use the
+number keys shown in the footer. H200 is the default. Your jobs are highlighted.
+Press q to quit; use --once for a printable snapshot instead.
+
+``squeue`` supplies the live job list and timing estimates. Slurm's compact GRES
+field only reports a GPU type and count, so this script enriches it with
+``scontrol show jobs -dd`` to recover the allocated device indices and with
+``scontrol show nodes`` to calculate schedulable idle and active GPUs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import getpass
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from itertools import zip_longest
+
+PREFERRED_GPU_TYPES = ("h200", "h100")
+RUNNING_STATES = {"RUNNING", "COMPLETING"}
+QUEUED_STATES = {"PENDING"}
+RANK_MEDALS = ("🥇", "🥈", "🥉")
+ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+UNSCHEDULABLE_STATES = (
+    "DOWN",
+    "DRAIN",
+    "FAIL",
+    "FUTURE",
+    "MAINT",
+    "NO_RESPOND",
+    "POWERED_DOWN",
+    "REBOOT",
+    "RESERVED",
+    "UNKNOWN",
+)
+
+
+@dataclass(frozen=True)
+class Job:
+    job_id: str
+    user: str
+    name: str
+    node_list: str
+    gres: str
+    left: str
+    end: str
+    state: str
+    start: str = "N/A"
+
+
+@dataclass(frozen=True)
+class Allocation:
+    node: str
+    gpu_type: str
+    count: int
+    indices: str
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    idle: dict[str, int]
+    active: dict[str, int]
+    total: dict[str, int]
+    jobs: list[Job]
+    allocations: dict[str, list[Allocation]]
+
+
+class SlurmCommandError(RuntimeError):
+    """Raised when a Slurm query fails."""
+
+
+def _run(command: Sequence[str]) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SlurmCommandError(f"{command[0]} timed out after 10 seconds") from error
+    except FileNotFoundError as error:
+        raise SlurmCommandError(f"command not found: {command[0]}") from error
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() or error.stdout.strip() or "unknown error"
+        raise SlurmCommandError(f"{' '.join(command)} failed: {detail}") from error
+    return result.stdout
+
+
+def parse_squeue(output: str) -> list[Job]:
+    jobs: list[Job] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("|")
+        if len(fields) not in {8, 9}:
+            raise ValueError(f"unexpected squeue row: {line!r}")
+        jobs.append(Job(*fields))
+    return jobs
+
+
+def _typed_tres(tres: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for gpu_type, count in re.findall(
+        r"(?:^|,)gres/gpu:([^,=]+)=(\d+)(?=,|$)", tres.lower()
+    ):
+        result[gpu_type] = int(count)
+    generic = re.search(r"(?:^|,)gres/gpu=(\d+)(?=,|$)", tres)
+    if generic:
+        untyped = int(generic.group(1)) - sum(result.values())
+        if untyped > 0:
+            result["any"] = untyped
+    return result
+
+
+def _ordered_gpu_types(gpu_types) -> list[str]:
+    return sorted(set(gpu_types), key=lambda gpu: (
+        PREFERRED_GPU_TYPES.index(gpu) if gpu in PREFERRED_GPU_TYPES else 2,
+        gpu == "any", gpu,
+    ))
+
+
+def _node_is_schedulable(state: str) -> bool:
+    upper = state.upper()
+    if upper.endswith("*") or upper.endswith("~") or upper.endswith("#"):
+        return False
+    return not any(flag in upper for flag in UNSCHEDULABLE_STATES)
+
+
+def parse_gpu_inventory(
+    output: str,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Return idle, active, and configured totals by GPU type."""
+
+    idle: dict[str, int] = {}
+    active: dict[str, int] = {}
+    total: dict[str, int] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        state_match = re.search(r"(?:^|\s)State=(\S+)", line)
+        configured_match = re.search(r"(?:^|\s)CfgTRES=(\S+)", line)
+        allocated_match = re.search(r"(?:^|\s)AllocTRES=(\S*)", line)
+        if state_match is None or configured_match is None:
+            continue
+        configured = _typed_tres(configured_match.group(1))
+        allocated = _typed_tres(
+            allocated_match.group(1) if allocated_match is not None else ""
+        )
+        for gpu_type, count in configured.items():
+            total[gpu_type] = total.get(gpu_type, 0) + count
+            idle.setdefault(gpu_type, 0)
+            active.setdefault(gpu_type, 0)
+            if _node_is_schedulable(state_match.group(1)):
+                active[gpu_type] += count
+                idle[gpu_type] += max(
+                    count - allocated.get(gpu_type, 0), 0
+                )
+    return idle, active, total
+
+
+def parse_idle_gpus(output: str) -> dict[str, int]:
+    return parse_gpu_inventory(output)[0]
+
+
+def _expand_number_list(value: str) -> list[str]:
+    values: list[str] = []
+    for part in value.split(","):
+        if "-" not in part:
+            values.append(part)
+            continue
+        start_text, end_text = part.split("-", 1)
+        start = int(start_text)
+        end = int(end_text)
+        width = max(len(start_text), len(end_text))
+        values.extend(f"{number:0{width}d}" for number in range(start, end + 1))
+    return values
+
+
+def expand_nodelist(value: str) -> list[str]:
+    """Expand common Slurm bracket ranges without starting another process."""
+
+    match = re.search(r"\[([^][]+)\]", value)
+    if match is None:
+        return [value]
+    prefix = value[: match.start()]
+    suffix = value[match.end() :]
+    expanded: list[str] = []
+    for number in _expand_number_list(match.group(1)):
+        expanded.extend(expand_nodelist(f"{prefix}{number}{suffix}"))
+    return expanded
+
+
+def _effective_job_id(header: str) -> str:
+    base_match = re.search(r"^JobId=(\S+)", header)
+    if base_match is None:
+        raise ValueError(f"missing JobId in {header!r}")
+    task_match = re.search(r"(?:^|\s)ArrayTaskId=(\S+)", header)
+    if task_match is None:
+        return base_match.group(1)
+    # Slurm gives a running array element its own internal JobId while squeue
+    # displays <ArrayJobId>_<ArrayTaskId>.  Join on the user-facing identifier.
+    array_match = re.search(r"(?:^|\s)ArrayJobId=(\S+)", header)
+    array_job_id = array_match.group(1) if array_match else base_match.group(1)
+    return f"{array_job_id}_{task_match.group(1)}"
+
+
+def parse_job_allocations(output: str) -> dict[str, list[Allocation]]:
+    allocations: dict[str, list[Allocation]] = {}
+    current_job: str | None = None
+    gpu_pattern = re.compile(
+        r"gpu(?::(?P<type>[^:,()]+))?:(?P<count>\d+)"
+        r"\(IDX:(?P<indices>[^)]+)\)",
+        re.IGNORECASE,
+    )
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("JobId="):
+            current_job = _effective_job_id(line)
+            allocations.setdefault(current_job, [])
+            continue
+        if current_job is None or not line.startswith("Nodes=") or " GRES=" not in line:
+            continue
+        node_match = re.match(r"Nodes=(\S+)", line)
+        gres_match = re.search(r"(?:^|\s)GRES=(\S+)", line)
+        if node_match is None or gres_match is None:
+            continue
+        nodes = expand_nodelist(node_match.group(1))
+        for match in gpu_pattern.finditer(gres_match.group(1)):
+            gpu_type = (match.group("type") or "any").lower()
+            count = int(match.group("count"))
+            if count == 0:
+                continue
+            indices = match.group("indices")
+            for node in nodes:
+                allocations[current_job].append(
+                    Allocation(node, gpu_type, count, indices)
+                )
+    return allocations
+
+
+def _fallback_allocations(job: Job) -> list[Allocation]:
+    matches = re.finditer(
+        r"(?:^|,)(?:gres/)?gpu(?::(?P<type>[^:,()]+))?:(?P<count>\d+)",
+        job.gres,
+        re.IGNORECASE,
+    )
+    return [
+        Allocation(job.node_list or "?", (match.group("type") or "any").lower(), int(match.group("count")), "?")
+        for match in matches if int(match.group("count")) > 0
+    ]
+
+
+def collect_snapshot() -> Snapshot:
+    queue = _run(
+        (
+            "squeue",
+            "--array",
+            "--noheader",
+            "--states=RUNNING,COMPLETING,PENDING",
+            "--format=%i|%u|%j|%N|%b|%L|%e|%T|%S",
+        )
+    )
+    nodes = _run(("scontrol", "show", "nodes", "--oneliner"))
+    details = _run(("scontrol", "show", "jobs", "--details"))
+    idle, active, total = parse_gpu_inventory(nodes)
+    return Snapshot(
+        idle=idle,
+        active=active,
+        total=total,
+        jobs=parse_squeue(queue),
+        allocations=parse_job_allocations(details),
+    )
+
+
+def _remaining_seconds(value: str) -> float:
+    if not re.fullmatch(r"(?:\d+-)?\d+:\d+(?::\d+)?", value):
+        return float("inf")
+    day_count = 0
+    clock = value
+    if "-" in value:
+        days, clock = value.split("-", 1)
+        day_count = int(days)
+    fields = [int(field) for field in clock.split(":")]
+    if len(fields) == 3:
+        hours, minutes, seconds = fields
+    elif len(fields) == 2:
+        hours = 0
+        minutes, seconds = fields
+    else:
+        return float("inf")
+    return day_count * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _remaining_label(value: str) -> str:
+    return _duration_label(_remaining_seconds(value))
+
+
+def _duration_label(seconds: float) -> str:
+    if seconds == float("inf"):
+        return "unknown"
+    total_minutes = int(seconds) // 60
+    if total_minutes == 0:
+        return "<1m"
+    hours, minutes = divmod(total_minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _timestamp(value: str) -> float:
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return float("inf")
+
+
+def _finish_key(job: Job, now: float) -> tuple[float, float, str, tuple[int, ...]]:
+    remaining = _remaining_seconds(job.left)
+    end = _timestamp(job.end)
+    if end == float("inf"):
+        if job.state.upper() in QUEUED_STATES:
+            end = _timestamp(job.start) + remaining
+        else:
+            end = now + remaining
+    # Jobs without a finish estimate follow known finishes, shortest limit first.
+    return end, remaining, job.name, tuple(map(int, re.findall(r"\d+", job.job_id)))
+
+
+def _start_label(value: str, now: float) -> str:
+    start = _timestamp(value)
+    if start == float("inf"):
+        return "start unknown"
+    if start < now:
+        return "start overdue"
+    return f"start in ~{_duration_label(start - now)}"
+
+
+def _style(text: str, *codes: str, color: bool) -> str:
+    if not color:
+        return text
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+
+def _display_width(text: str) -> int:
+    return sum(
+        0 if unicodedata.combining(char) or unicodedata.category(char) == "Cf"
+        else 2 if unicodedata.east_asian_width(char) in {"W", "F"}
+        else 1
+        for char in ANSI_PATTERN.sub("", text)
+    )
+
+
+def _wrap_line(line: str, width: int) -> list[str]:
+    """Wrap at spaces while preserving ANSI styles and wide-character alignment."""
+    characters: list[tuple[str, str]] = []
+    active_style = ""
+    for token in re.findall(r"\x1b\[[0-9;]*m|[^\x1b]", line):
+        if ANSI_PATTERN.fullmatch(token):
+            active_style = "" if token == "\033[0m" else token
+        else:
+            characters.append((token, active_style))
+    wrapped: list[str] = []
+    indent = ""
+    while characters:
+        used = len(indent)
+        end = 0
+        last_space = 0
+        content_seen = False
+        for char, _ in characters:
+            char_width = _display_width(char)
+            if used + char_width > width:
+                break
+            used += char_width
+            end += 1
+            if char == " " and content_seen:
+                last_space = end
+            elif char != " ":
+                content_seen = True
+        if end < len(characters) and last_space:
+            next_word = []
+            for char, _ in characters[last_space:]:
+                if char == " ":
+                    break
+                next_word.append(char)
+            # Split a word that cannot fit on a continuation line in place,
+            # rather than leaving a tree branch by itself on the previous line.
+            if _display_width("".join(next_word)) <= width - min(5, width // 4):
+                end = last_space
+        end = max(end, 1)
+        fragment = characters[:end]
+        while fragment and fragment[-1][0] == " ":
+            fragment.pop()
+        parts = [indent]
+        active_style = ""
+        for char, style in fragment:
+            if style != active_style:
+                if active_style:
+                    parts.append("\033[0m")
+                if style:
+                    parts.append(style)
+                active_style = style
+            parts.append(char)
+        if active_style:
+            parts.append("\033[0m")
+        wrapped.append("".join(parts))
+        characters = characters[end:]
+        while characters and characters[0][0] == " ":
+            characters.pop(0)
+        indent = " " * min(5, width // 4)
+    return wrapped or [""]
+
+
+def _side_by_side(left: list[str], right: list[str], width: int) -> list[str]:
+    left_width = (width - 3) // 2
+    right_width = width - 3 - left_width
+    left_lines = [part for line in left for part in _wrap_line(line, left_width)]
+    right_lines = [part for line in right for part in _wrap_line(line, right_width)]
+    return [
+        f"{a}{' ' * (left_width - _display_width(a))} │ {b}".rstrip()
+        for a, b in zip_longest(left_lines, right_lines, fillvalue="")
+    ]
+
+
+def _remaining_color(value: str) -> str:
+    seconds = _remaining_seconds(value)
+    if seconds <= 3600:
+        return "31"
+    if seconds <= 6 * 3600:
+        return "33"
+    if seconds < float("inf"):
+        return "32"
+    return "2"
+
+
+def _gpu_usage(allocations: Sequence[Allocation]) -> dict[str, int]:
+    usage: dict[str, int] = {}
+    for allocation in allocations:
+        usage[allocation.gpu_type] = usage.get(allocation.gpu_type, 0) + allocation.count
+    return usage
+
+
+def _usage_label(usage: dict[str, int]) -> str:
+    parts = [
+        f"{usage[gpu_type]}×{gpu_type.upper()}"
+        for gpu_type in _ordered_gpu_types(usage)
+        if usage[gpu_type]
+    ]
+    return ", ".join(parts) or "0×GPU"
+
+
+def _available_gpu_types(snapshot: Snapshot) -> list[str]:
+    types = set(snapshot.total)
+    for job in snapshot.jobs:
+        allocations = snapshot.allocations.get(job.job_id) or _fallback_allocations(job)
+        types.update(a.gpu_type for a in allocations if a.count)
+    return _ordered_gpu_types(types) or ["h200"]
+
+
+def _gpu_shortcuts(gpu_types: Sequence[str]) -> dict[str, str]:
+    shortcuts = {key: gpu for key, gpu in (("1", "h100"), ("2", "h200")) if gpu in gpu_types}
+    for key, gpu in zip("3456789", (gpu for gpu in gpu_types if gpu not in PREFERRED_GPU_TYPES)):
+        shortcuts[key] = gpu
+    return shortcuts
+
+
+def _id_label(allocations: Sequence[Allocation]) -> str:
+    return ", ".join(
+        f"{allocation.node}:{allocation.gpu_type.upper()}[{allocation.indices}]"
+        for allocation in allocations
+    )
+
+
+def _group_jobs(
+    snapshot: Snapshot, states: set[str], gpu_type: str | None = None
+) -> list[
+    tuple[
+        int,
+        str,
+        dict[str, int],
+        list[tuple[Job, list[Allocation], dict[str, int]]],
+    ]
+]:
+    grouped: dict[str, list[tuple[Job, list[Allocation], dict[str, int]]]] = {}
+    for job in snapshot.jobs:
+        if job.state.upper() not in states:
+            continue
+        job_allocations = snapshot.allocations.get(job.job_id) or _fallback_allocations(
+            job
+        )
+        if gpu_type is not None:
+            job_allocations = [a for a in job_allocations if a.gpu_type == gpu_type]
+        usage = _gpu_usage(job_allocations)
+        if sum(usage.values()) == 0:
+            continue
+        grouped.setdefault(job.user, []).append((job, job_allocations, usage))
+
+    user_rows: list[
+        tuple[
+            int,
+            str,
+            dict[str, int],
+            list[tuple[Job, list[Allocation], dict[str, int]]],
+        ]
+    ] = []
+    for user, jobs in grouped.items():
+        total: dict[str, int] = {}
+        for _, _, usage in jobs:
+            for gpu, count in usage.items():
+                total[gpu] = total.get(gpu, 0) + count
+        user_rows.append((sum(total.values()), user, total, jobs))
+    user_rows.sort(key=lambda row: (-row[0], row[1]))
+    return user_rows
+
+
+def _render_user_rows(
+    lines: list[str],
+    user_rows: list[
+        tuple[
+            int,
+            str,
+            dict[str, int],
+            list[tuple[Job, list[Allocation], dict[str, int]]],
+        ]
+    ],
+    *,
+    max_jobs: int,
+    show_ids: bool,
+    color: bool,
+    now: float,
+    queued: bool = False,
+    current_user: str | None = None,
+) -> None:
+    for user_index, (_, user, total, jobs) in enumerate(user_rows):
+        if user_index:
+            lines.append("")
+        medal = RANK_MEDALS[user_index] if user_index < len(RANK_MEDALS) else "  "
+        own = user == current_user
+        user_label = f"{user} (you)" if own else user
+        user_display = _style(
+            f"{user_label:<16}", "1", "7" if own else "36", color=color
+        )
+        usage_display = _style(_usage_label(total), "1", "35", color=color)
+        lines.append(f"{medal} {user_display}  {usage_display}")
+        jobs = sorted(jobs, key=lambda row: _finish_key(row[0], now))
+        shown = jobs[:max_jobs] if max_jobs else jobs
+        omitted = len(jobs) - len(shown)
+        for job_index, (job, allocations, usage) in enumerate(shown):
+            is_last = job_index == len(shown) - 1 and omitted == 0
+            branch = "└─" if is_last else "├─"
+            remaining = _remaining_label(job.left)
+            if queued:
+                timing = (
+                    f"{_style(_start_label(job.start, now), '1', '33', color=color)}"
+                    f"  limit {remaining}"
+                )
+            else:
+                timing = (
+                    "end in "
+                    f"{_style(remaining, '1', _remaining_color(job.left), color=color)}"
+                )
+            name = f"{job.name[:10]:<10}"
+            is_array_task = "_" in job.job_id
+            if is_array_task:
+                name += f" [{job.job_id}]"
+            name_display = _style(name, *(('1', '7') if own else ('1',)), color=color)
+            detail = (
+                f"  {_style(branch, '2', color=color)} "
+                f"{name_display}  "
+                f"{_style(f'{_usage_label(usage):<8}', '33', color=color)}  "
+                f"{timing}"
+            )
+            if show_ids:
+                if queued and not is_array_task:
+                    detail += f"  │  job {job.job_id}"
+                elif not queued:
+                    detail += f"  │  {_id_label(allocations)}"
+            lines.append(detail)
+        if omitted:
+            lines.append(
+                _style("  └─ … more jobs hidden", "2", color=color)
+            )
+
+
+def render(
+    snapshot: Snapshot,
+    *,
+    max_jobs: int = 5,
+    show_ids: bool = False,
+    color: bool = False,
+    width: int | None = None,
+    now: float | None = None,
+    gpu_type: str | None = None,
+    current_user: str | None = None,
+) -> str:
+    if width is None:
+        width = shutil.get_terminal_size(fallback=(140, 24)).columns
+    width = max(width, 20)
+    if now is None:
+        now = time.time()
+    types = [gpu_type] if gpu_type else _available_gpu_types(snapshot)
+    status = "  │  ".join(
+        f"{gpu.upper()} idle {snapshot.idle.get(gpu, 0)}/{snapshot.total.get(gpu, 0)}, "
+        f"active {snapshot.active.get(gpu, 0)}"
+        if gpu != "any" or gpu in snapshot.total else "ANY: GPU type unspecified"
+        for gpu in types
+    )
+    lines = [f"{_style('GPU STATUS', '1', '36', color=color)}  │  {status}"]
+    lines = _wrap_line(lines[0], width)
+    lines.append(_style("─" * width, "2", color=color))
+    running_lines = [_style("RUNNING GPU JOBS", "1", "36", color=color), ""]
+    queued_lines = [_style("PENDING GPU JOBS", "1", "36", color=color), ""]
+    gpu_label = gpu_type.upper() if gpu_type else "GPU"
+    running_rows = _group_jobs(snapshot, RUNNING_STATES, gpu_type)
+    if not running_rows:
+        running_lines.append(f"No running {gpu_label} jobs")
+    else:
+        _render_user_rows(
+            running_lines,
+            running_rows,
+            max_jobs=max_jobs,
+            show_ids=show_ids,
+            color=color,
+            now=now,
+            current_user=current_user,
+        )
+
+    queued_rows = _group_jobs(snapshot, QUEUED_STATES, gpu_type)
+    if not queued_rows:
+        queued_lines.append(f"No pending {gpu_label} jobs")
+    else:
+        _render_user_rows(
+            queued_lines,
+            queued_rows,
+            max_jobs=max_jobs,
+            show_ids=show_ids,
+            color=color,
+            now=now,
+            queued=True,
+            current_user=current_user,
+        )
+    lines.extend(_side_by_side(running_lines, queued_lines, width))
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class PanelLine:
+    text: str
+    own: bool = False
+    heading: bool = False
+
+
+@dataclass
+class ViewState:
+    gpu_type: str = "h200"
+    gpu_types: list[str] = field(default_factory=lambda: list(PREFERRED_GPU_TYPES))
+    pane: int = 0
+    offsets: dict[tuple[str, int], int] = field(default_factory=dict)
+
+    def offset(self, pane: int) -> int:
+        return self.offsets.get((self.gpu_type, pane), 0)
+
+    def clamp(self, counts: Sequence[int], page_height: int) -> None:
+        for pane, count in enumerate(counts):
+            self.offsets[self.gpu_type, pane] = min(
+                max(0, self.offset(pane)), max(0, count - page_height)
+            )
+
+
+def _handle_key(
+    state: ViewState, key: int, page_height: int, counts: Sequence[int]
+) -> str:
+    if key in (ord("q"), ord("Q")):
+        return "quit"
+    if key == ord("r"):
+        return "refresh"
+    if key in (curses.KEY_LEFT, ord("h")):
+        state.pane = 0
+    elif key in (curses.KEY_RIGHT, ord("l")):
+        state.pane = 1
+    elif key == ord("\t"):
+        state.pane = 1 - state.pane
+    elif key in (ord("["), ord("]"), ord("g")) or key in range(ord("1"), ord("9") + 1):
+        if key in (ord("["), ord("]"), ord("g")):
+            index = state.gpu_types.index(state.gpu_type)
+            step = -1 if key == ord("[") else 1
+            state.gpu_type = state.gpu_types[(index + step) % len(state.gpu_types)]
+        else:
+            state.gpu_type = _gpu_shortcuts(state.gpu_types).get(chr(key), state.gpu_type)
+        # Restore this GPU's scroll positions after its rows have been rebuilt.
+        return ""
+    else:
+        offset = state.offset(state.pane)
+        if key in (curses.KEY_DOWN, ord("j")):
+            offset += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            offset -= 1
+        elif key in (curses.KEY_NPAGE, 4):  # Page Down / Ctrl+D
+            offset += page_height
+        elif key in (curses.KEY_PPAGE, 21):  # Page Up / Ctrl+U
+            offset -= page_height
+        elif key == curses.KEY_HOME:
+            offset = 0
+        elif key in (curses.KEY_END, ord("G")):
+            offset = counts[state.pane]
+        state.offsets[state.gpu_type, state.pane] = offset
+    state.clamp(counts, page_height)
+    return ""
+
+
+def _panel_lines(
+    snapshot: Snapshot,
+    states: set[str],
+    gpu_type: str,
+    width: int,
+    current_user: str,
+    now: float,
+    *,
+    max_jobs: int | None = None,
+    show_ids: bool = False,
+) -> tuple[list[PanelLine], int]:
+    lines: list[PanelLine] = []
+    groups = _group_jobs(snapshot, states, gpu_type)
+    job_count = sum(len(group[3]) for group in groups)
+
+    def append(text: str, own: bool = False, heading: bool = False) -> None:
+        lines.extend(PanelLine(part, own, heading) for part in _wrap_line(text, width))
+
+    for rank, (_, user, total, jobs) in enumerate(groups, 1):
+        if lines:
+            append("")
+        own = user == current_user
+        who = f"{user} (you)" if own else user
+        append(f"{rank}. {who}  {total[gpu_type]}×{gpu_type.upper()}", own, True)
+        jobs = sorted(jobs, key=lambda row: _finish_key(row[0], now))
+        shown = jobs[:max_jobs] if max_jobs else jobs
+        for index, (job, allocations, usage) in enumerate(shown):
+            branch = "└─" if index == len(jobs) - 1 else "├─"
+            append(f"  {branch} {job.name} [{job.job_id}]  {_usage_label(usage)}", own)
+            if job.state.upper() in QUEUED_STATES:
+                timing = f"{_start_label(job.start, now)}  limit {_remaining_label(job.left)}"
+            else:
+                end = _timestamp(job.end)
+                remaining = (
+                    _duration_label(max(0, end - now))
+                    if end < float("inf") else _remaining_label(job.left)
+                )
+                timing = f"end in {remaining}"
+            append(f"     {timing}", own)
+            if show_ids and job.state.upper() in RUNNING_STATES:
+                append(f"     {_id_label(allocations)}", own)
+        omitted = len(jobs) - len(shown)
+        if omitted:
+            append("  └─ … more jobs (--max-jobs 0 shows all)", own)
+    if not lines:
+        state_label = "pending" if states == QUEUED_STATES else "running"
+        append(f"No {state_label} {gpu_type.upper()} jobs")
+    return lines, job_count
+
+
+class SnapshotLoader:
+    """Fetch Slurm data off the input thread so navigation stays responsive."""
+
+    def __init__(self) -> None:
+        self.results: queue.Queue[tuple[Snapshot | None, str]] = queue.Queue()
+        self.running = False
+
+    def request(self) -> None:
+        if self.running:
+            return
+        self.running = True
+        threading.Thread(target=self._collect, daemon=True).start()
+
+    def _collect(self) -> None:
+        try:
+            self.results.put((collect_snapshot(), ""))
+        except Exception as error:
+            self.results.put((None, str(error)))
+
+    def poll(self) -> tuple[Snapshot | None, str] | None:
+        try:
+            result = self.results.get_nowait()
+        except queue.Empty:
+            return None
+        self.running = False
+        return result
+
+
+def _clip_text(text: str, width: int) -> str:
+    result: list[str] = []
+    used = 0
+    for char in text:
+        if unicodedata.category(char) == "Cc":
+            char = " "
+        size = _display_width(char)
+        if used + size > width:
+            break
+        result.append(char)
+        used += size
+    return "".join(result)
+
+
+def _gpu_footer(state: ViewState, width: int) -> tuple[str, str]:
+    keys = {gpu: key for key, gpu in _gpu_shortcuts(state.gpu_types).items()}
+    labels = {gpu: f"{keys[gpu]}:{gpu.upper()}" if gpu in keys else gpu.upper() for gpu in state.gpu_types}
+    selected = labels[state.gpu_type]
+    footer = "  ".join(labels[gpu] for gpu in state.gpu_types) + "  [/]/g:GPU"
+    if _display_width(footer) > width:
+        index = state.gpu_types.index(state.gpu_type) + 1
+        footer = f"{selected} {index}/{len(state.gpu_types)}  [/]/g:GPU"
+    return footer, selected
+
+
+def _write(screen, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
+    height, columns = screen.getmaxyx()
+    width = min(width, columns - x)
+    if not (0 <= y < height and 0 <= x < columns) or width <= 0:
+        return
+    clipped = _clip_text(text, width)
+    padded = clipped + " " * (width - _display_width(clipped))
+    try:
+        screen.addstr(y, x, padded, attr)
+    except curses.error:
+        # ncurses may report an error after writing the bottom-right cell, or
+        # when tmux resizes the pane between getmaxyx() and addstr().
+        pass
+
+
+def _draw_screen(
+    screen,
+    state: ViewState,
+    panels: Sequence[tuple[list[PanelLine], int]],
+    snapshot: Snapshot | None,
+    current_user: str,
+    interval: float,
+    updated: float | None,
+    error: str,
+    loading: bool,
+    title_attr: int,
+    own_attr: int,
+) -> None:
+    height, width = screen.getmaxyx()
+    screen.erase()
+    if width < 30 or height < 8:
+        _write(screen, 0, 0, "Resize to at least 30×8", width, curses.A_BOLD)
+        _write(screen, height - 1, 0, "[/]/g:GPU q:quit", width)
+        screen.refresh()
+        return
+    gpu = state.gpu_type
+    inventory = (
+        f"idle {snapshot.idle.get(gpu, 0)}/{snapshot.total.get(gpu, 0)}  active {snapshot.active.get(gpu, 0)}"
+        if snapshot else "Loading Slurm jobs…"
+    )
+    if gpu == "any" and snapshot and gpu not in snapshot.total:
+        inventory = "GPU type unspecified"
+    _write(screen, 0, 0, f"sinner-top  {gpu.upper()}  |  {inventory}", width, title_attr)
+    updated_label = time.strftime("%H:%M:%S", time.localtime(updated)) if updated else "--:--:--"
+    _write(screen, 1, 0, f"Updated {updated_label}  refresh {interval:g}s  |  you: {current_user} (highlighted)", width, curses.A_DIM)
+    left_width = (width - 1) // 2
+    widths = (left_width, width - left_width - 1)
+    starts = (0, left_width + 1)
+    page_height = height - 6
+    for pane, (lines, _) in enumerate(panels):
+        label = "RUNNING" if pane == 0 else "PENDING"
+        focused = state.pane == pane
+        attr = title_attr | (curses.A_REVERSE if focused else 0)
+        _write(screen, 2, starts[pane], f"{'>' if focused else ' '} {label}", widths[pane], attr)
+        visible = lines[state.offset(pane):state.offset(pane) + page_height]
+        for row, line in enumerate(visible, 3):
+            attr = own_attr if line.own else 0
+            if line.heading:
+                attr |= curses.A_BOLD
+            _write(screen, row, starts[pane], line.text, widths[pane], attr)
+    for row in range(2, height - 3):
+        _write(screen, row, left_width, "│", 1, curses.A_DIM)
+    count = len(panels[state.pane][0])
+    first = state.offset(state.pane) + 1 if count else 0
+    last = min(state.offset(state.pane) + page_height, count)
+    label = "Running" if state.pane == 0 else "Pending"
+    status = f"{label} lines {first}–{last}/{count}  |  PgUp/PgDn Home/End"
+    if error:
+        status = f"Slurm: {error}  (r: retry)"
+    elif loading:
+        status += "  |  Refreshing…"
+    _write(screen, height - 3, 0, status, width, curses.A_DIM)
+    controls = "←/h →/l pane  ↑/k ↓/j scroll  r:refresh  q:quit"
+    if width < _display_width(controls):
+        controls = "h/l:pane j/k:scroll q:quit"
+    _write(screen, height - 2, 0, controls, width, curses.A_DIM)
+    footer, selected = _gpu_footer(state, width)
+    _write(screen, height - 1, 0, footer, width)
+    _write(screen, height - 1, footer.index(selected), selected, len(selected), title_attr | curses.A_REVERSE)
+    screen.refresh()
+
+
+def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user: str) -> int:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    curses.set_escdelay(25)
+    screen.keypad(True)
+    screen.timeout(100)
+    title_attr = curses.A_BOLD
+    own_attr = curses.A_REVERSE
+    if use_color and curses.has_colors():
+        curses.start_color()
+        background = curses.COLOR_BLACK
+        try:
+            curses.use_default_colors()
+            background = -1
+        except curses.error:
+            pass
+        curses.init_pair(1, curses.COLOR_CYAN, background)
+        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
+        title_attr |= curses.color_pair(1)
+        own_attr = curses.color_pair(2)
+    state = ViewState(gpu_type=args.gpu)
+    loader = SnapshotLoader()
+    snapshot: Snapshot | None = None
+    updated: float | None = None
+    error = ""
+    next_refresh = 0.0
+    cache_key = None
+    panels: list[tuple[list[PanelLine], int]] = []
+    while True:
+        result = loader.poll()
+        if result is not None:
+            fresh, error = result
+            if fresh is not None:
+                snapshot = fresh
+                updated = time.time()
+                state.gpu_types = _available_gpu_types(snapshot)
+                if state.gpu_type not in state.gpu_types:
+                    state.gpu_type = state.gpu_types[0]
+        if time.monotonic() >= next_refresh:
+            loader.request()
+            next_refresh = time.monotonic() + args.interval
+        height, width = screen.getmaxyx()
+        now = time.time()
+        key = (id(snapshot), state.gpu_type, width, int(now))
+        if key != cache_key:
+            left_width = max(2, (width - 1) // 2)
+            right_width = max(2, width - left_width - 1)
+            panels = [
+                _panel_lines(
+                    snapshot, states, state.gpu_type, pane_width, current_user, now,
+                    max_jobs=args.max_jobs, show_ids=args.show_ids,
+                ) if snapshot else ([PanelLine("Loading Slurm jobs…")], 0)
+                for states, pane_width in ((RUNNING_STATES, left_width), (QUEUED_STATES, right_width))
+            ]
+            cache_key = key
+        page_height = max(1, height - 6)
+        counts = [len(lines) for lines, _ in panels]
+        state.clamp(counts, page_height)
+        _draw_screen(
+            screen, state, panels, snapshot, current_user, args.interval,
+            updated, error, loader.running, title_attr, own_attr,
+        )
+        action = _handle_key(state, screen.getch(), page_height, counts)
+        if action == "quit":
+            return 0
+        if action == "refresh":
+            loader.request()
+            next_refresh = time.monotonic() + args.interval
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sinner-top", description=__doc__)
+    parser.add_argument(
+        "-n",
+        "--interval",
+        type=float,
+        default=5.0,
+        help="refresh interval in seconds (default: 5)",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="print one snapshot and exit (also the default when output is piped)",
+    )
+    parser.add_argument(
+        "-w",
+        "--watch",
+        action="store_true",
+        help="refresh continuously (interactive mode is already the terminal default)",
+    )
+    parser.add_argument(
+        "--max-jobs",
+        type=int,
+        default=None,
+        help="jobs shown per user; 0 shows all (default: all interactively, 5 with --once)",
+    )
+    parser.add_argument(
+        "--gpu",
+        type=str.lower,
+        metavar="TYPE",
+        default="h200",
+        help="GPU type to show initially (default: h200; [/]/g cycles all discovered types)",
+    )
+    parser.add_argument(
+        "--show-ids",
+        action="store_true",
+        help="also show node names and allocated GPU indices",
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="color mode (default: auto; honors NO_COLOR)",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.interval <= 0:
+        raise SystemExit("--interval must be positive")
+    if args.max_jobs is not None and args.max_jobs < 0:
+        raise SystemExit("--max-jobs must be zero or positive")
+    watch = args.watch and not args.once
+    use_color = args.color == "always" or (
+        args.color == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    )
+    first = True
+    try:
+        current_user = getpass.getuser()
+        if sys.stdin.isatty() and sys.stdout.isatty() and not args.once:
+            # Use the live tty dimensions, including inside resized tmux panes,
+            # rather than any stale dimensions inherited from the parent shell.
+            os.environ.pop("LINES", None)
+            os.environ.pop("COLUMNS", None)
+            return curses.wrapper(_interactive, args, use_color, current_user)
+        while True:
+            snapshot = collect_snapshot()
+            if watch and not first:
+                print("\033[H\033[J", end="")
+            print(
+                render(
+                    snapshot,
+                    max_jobs=5 if args.max_jobs is None else args.max_jobs,
+                    show_ids=args.show_ids,
+                    color=use_color,
+                    gpu_type=args.gpu,
+                    current_user=current_user,
+                ),
+                flush=True,
+            )
+            first = False
+            if not watch:
+                return 0
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+    except (SlurmCommandError, ValueError, curses.error) as error:
+        print(f"sinner-top: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
