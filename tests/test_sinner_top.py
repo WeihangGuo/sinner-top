@@ -120,13 +120,13 @@ class SinnerTopChecks(unittest.TestCase):
     def test_navigation_independent_offsets_and_boundaries(self):
         state = m.ViewState()
         counts = [100, 200]
-        for _ in range(3):
-            m._handle_key(state, ord("j"), 10, counts)
+        for key in (ord("j"), curses.KEY_DOWN, ord("j")):
+            m._handle_key(state, key, 10, counts)
         m._handle_key(state, curses.KEY_RIGHT, 10, counts)
         m._handle_key(state, curses.KEY_NPAGE, 10, counts)
-        self.assertEqual([state.offset(0), state.offset(1)], [3, 10])
+        self.assertEqual([state.offset(0), state.offset(1)], [15, 10])
         m._handle_key(state, ord("k"), 10, counts)
-        self.assertEqual(state.offset(1), 9)
+        self.assertEqual(state.offset(1), 5)
         m._handle_key(state, curses.KEY_END, 10, counts)
         self.assertEqual(state.offset(1), 190)
         m._handle_key(state, ord("j"), 10, counts)
@@ -136,7 +136,7 @@ class SinnerTopChecks(unittest.TestCase):
         self.assertEqual(state.offset(1), 0)
         m._handle_key(state, ord("h"), 10, counts)
         self.assertEqual(state.pane, 0)
-        self.assertEqual(state.offset(0), 3)
+        self.assertEqual(state.offset(0), 15)
 
     def test_all_gpu_types_are_reachable_and_positions_preserved(self):
         state = m.ViewState(gpu_types=["h200", "h100", "24gb", "47gb", "any"])

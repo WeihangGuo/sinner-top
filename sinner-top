@@ -713,9 +713,9 @@ def _handle_key(
     else:
         offset = state.offset(state.pane)
         if key in (curses.KEY_DOWN, ord("j")):
-            offset += 1
+            offset += 5
         elif key in (curses.KEY_UP, ord("k")):
-            offset -= 1
+            offset -= 5
         elif key in (curses.KEY_NPAGE, 4):  # Page Down / Ctrl+D
             offset += page_height
         elif key in (curses.KEY_PPAGE, 21):  # Page Up / Ctrl+U
@@ -904,9 +904,9 @@ def _draw_screen(
     elif loading:
         status += "  |  Refreshing…"
     _write(screen, height - 3, 0, status, width, curses.A_DIM)
-    controls = "←/h →/l pane  ↑/k ↓/j scroll  r:refresh  q:quit"
+    controls = "←/h →/l pane  ↑/k ↓/j 5 lines  r:refresh  q:quit"
     if width < _display_width(controls):
-        controls = "h/l:pane j/k:scroll q:quit"
+        controls = "h/l:pane j/k:5lines q:quit"
     _write(screen, height - 2, 0, controls, width, curses.A_DIM)
     footer, selected = _gpu_footer(state, width)
     _write(screen, height - 1, 0, footer, width)

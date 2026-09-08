@@ -71,8 +71,8 @@ All array tasks are available by scrolling in the interactive interface.
 | --- | --- |
 | Left / `h` | Select Running |
 | Right / `l` | Select Pending |
-| Up / `k` | Scroll up |
-| Down / `j` | Scroll down |
+| Up / `k` | Scroll up 5 lines |
+| Down / `j` | Scroll down 5 lines |
 | Tab | Switch panes |
 | Page Up / Ctrl+U | Scroll one page up |
 | Page Down / Ctrl+D | Scroll one page down |
