@@ -7,13 +7,14 @@ available, plus their runtime limit. Array tasks are counted individually and
 displayed with their task IDs.
 
 In a terminal, use arrows or hjkl to choose a pane and scroll. Press [ or ] to
-cycle through GPU types and rankings (g also advances), or use the
+cycle through GPU types, nodes and rankings (g also advances), or use the
 number keys shown in the footer. H200 is the default. Your jobs are highlighted.
 Press 0 for a plain live ranking, or t for the all-time GPU-hours podium.
 The winner occupies half the screen and the runners-up share the other half.
 Account and user details are expanded by default. Down/j opens rank 4 onward;
 b returns and replays the hero entrance. Use e to pause effects, m for compact
-faces, and q to quit. Use --once for a printable snapshot instead.
+faces, and q to quit. Press n for H200 availability by node, with GPU IDs and
+job end countdowns. Use --once for a printable snapshot instead.
 
 ``squeue`` supplies the live job list and timing estimates. Slurm's compact GRES
 field only reports a GPU type and count, so this script enriches it with
@@ -176,12 +177,27 @@ class Allocation:
 
 
 @dataclass(frozen=True)
+class NodeInventory:
+    name: str
+    state: str
+    total: dict[str, int]
+    allocated: dict[str, int]
+
+    def free(self, gpu: str) -> int:
+        return max(0, self.total.get(gpu, 0) - self.allocated.get(gpu, 0))
+
+    def idle(self, gpu: str) -> int:
+        return self.free(gpu) if _node_is_schedulable(self.state) else 0
+
+
+@dataclass(frozen=True)
 class Snapshot:
     idle: dict[str, int]
     active: dict[str, int]
     total: dict[str, int]
     jobs: list[Job]
     allocations: dict[str, list[Allocation]]
+    nodes: list[NodeInventory] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -262,14 +278,8 @@ def _node_is_schedulable(state: str) -> bool:
     return not any(flag in upper for flag in UNSCHEDULABLE_STATES)
 
 
-def parse_gpu_inventory(
-    output: str,
-) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
-    """Return idle, active, and configured totals by GPU type."""
-
-    idle: dict[str, int] = {}
-    active: dict[str, int] = {}
-    total: dict[str, int] = {}
+def parse_gpu_nodes(output: str) -> list[NodeInventory]:
+    nodes = []
     for line in output.splitlines():
         if not line.strip():
             continue
@@ -282,16 +292,40 @@ def parse_gpu_inventory(
         allocated = _typed_tres(
             allocated_match.group(1) if allocated_match is not None else ""
         )
-        for gpu_type, count in configured.items():
+        # An untyped allocation is unambiguous on a single-type GPU node.
+        if len(configured) == 1 and "any" not in configured and "any" in allocated:
+            gpu = next(iter(configured))
+            allocated[gpu] = allocated.get(gpu, 0) + allocated.pop("any")
+        name_match = re.search(r"(?:^|\s)NodeName=(\S+)", line)
+        nodes.append(NodeInventory(
+            name_match.group(1) if name_match else "?",
+            state_match.group(1), configured, allocated,
+        ))
+    return nodes
+
+
+def _gpu_inventory(
+    nodes: Sequence[NodeInventory],
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    idle: dict[str, int] = {}
+    active: dict[str, int] = {}
+    total: dict[str, int] = {}
+    for node in nodes:
+        for gpu_type, count in node.total.items():
             total[gpu_type] = total.get(gpu_type, 0) + count
             idle.setdefault(gpu_type, 0)
             active.setdefault(gpu_type, 0)
-            if _node_is_schedulable(state_match.group(1)):
+            if _node_is_schedulable(node.state):
                 active[gpu_type] += count
-                idle[gpu_type] += max(
-                    count - allocated.get(gpu_type, 0), 0
-                )
+                idle[gpu_type] += node.free(gpu_type)
     return idle, active, total
+
+
+def parse_gpu_inventory(
+    output: str,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Return idle, active, and configured totals by GPU type."""
+    return _gpu_inventory(parse_gpu_nodes(output))
 
 
 def parse_idle_gpus(output: str) -> dict[str, int]:
@@ -315,6 +349,15 @@ def _expand_number_list(value: str) -> list[str]:
 def expand_nodelist(value: str) -> list[str]:
     """Expand common Slurm bracket ranges without starting another process."""
 
+    # Split commas between hosts before expanding commas inside brackets.
+    depth = 0
+    for index, char in enumerate(value):
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            return expand_nodelist(value[:index]) + expand_nodelist(value[index + 1:])
     match = re.search(r"\[([^][]+)\]", value)
     if match is None:
         return [value]
@@ -398,13 +441,15 @@ def collect_snapshot() -> Snapshot:
     )
     nodes = _run(("scontrol", "show", "nodes", "--oneliner"))
     details = _run(("scontrol", "show", "jobs", "--details"))
-    idle, active, total = parse_gpu_inventory(nodes)
+    inventory = parse_gpu_nodes(nodes)
+    idle, active, total = _gpu_inventory(inventory)
     return Snapshot(
         idle=idle,
         active=active,
         total=total,
         jobs=parse_squeue(queue),
         allocations=parse_job_allocations(details),
+        nodes=inventory,
     )
 
 
@@ -930,6 +975,7 @@ class PanelLine:
     podium_rank: int | None = None
     flash: bool = False
     tints: tuple[tuple[int, int, int], ...] = ()  # character start, length, shade
+    remaining_start: int | None = None  # only color the timing suffix, if given
 
 
 @dataclass
@@ -948,11 +994,15 @@ class ViewState:
 
     @property
     def rankings(self) -> bool:
+        return self.view in {"live", "history"}
+
+    @property
+    def single_panel(self) -> bool:
         return self.view != "jobs"
 
     @property
     def focused_pane(self) -> int:
-        return 0 if self.rankings else self.pane
+        return 0 if self.single_panel else self.pane
 
     def select_view(self, view: str) -> None:
         if view != self.view:
@@ -974,14 +1024,14 @@ class ViewState:
         self.animation_tick = now
 
     def offset(self, pane: int) -> int:
-        if self.rankings:
+        if self.single_panel:
             return self.ranking_offsets.get(self.view, 0)
         return self.offsets.get((self.gpu_type, pane), 0)
 
     def clamp(self, counts: Sequence[int], page_height: int) -> None:
-        for pane, count in enumerate(counts[:1] if self.rankings else counts):
+        for pane, count in enumerate(counts[:1] if self.single_panel else counts):
             offset = min(max(0, self.offset(pane)), max(0, count - page_height))
-            if self.rankings:
+            if self.single_panel:
                 self.ranking_offsets[self.view] = offset
             else:
                 self.offsets[self.gpu_type, pane] = offset
@@ -994,8 +1044,8 @@ def _handle_key(
         return "quit"
     if key == ord("r"):
         return "refresh"
-    if key in (ord("0"), ord("a"), ord("t")):
-        target = "history" if key == ord("t") else "live"
+    if key in (ord("0"), ord("a"), ord("t"), ord("n")):
+        target = {ord("t"): "history", ord("n"): "nodes"}.get(key, "live")
         state.select_view("jobs" if state.view == target else target)
         return ""
     if key == ord("e") and state.view == "history":
@@ -1015,6 +1065,10 @@ def _handle_key(
             state.show_podium()
             return ""
     pane = state.focused_pane
+    if state.view == "nodes" and key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), ord("\t")):
+        state.select_view("jobs")
+        state.pane = 0 if key in (curses.KEY_LEFT, ord("h")) else 1
+        return ""
     if state.rankings and key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), ord("\t")):
         target = "live" if key in (curses.KEY_LEFT, ord("h")) else "history"
         if key == ord("\t"):
@@ -1029,10 +1083,10 @@ def _handle_key(
         pane = 1 - pane
     elif key in (ord("["), ord("]"), ord("g")) or key in range(ord("1"), ord("9") + 1):
         if key in (ord("["), ord("]"), ord("g")):
-            views = state.gpu_types + ["live", "history"]
-            index = views.index(state.view if state.rankings else state.gpu_type)
+            views = state.gpu_types + ["nodes", "live", "history"]
+            index = views.index(state.view if state.single_panel else state.gpu_type)
             target = views[(index + (-1 if key == ord("[") else 1)) % len(views)]
-            if target in ("live", "history"):
+            if target in ("nodes", "live", "history"):
                 state.select_view(target)
             else:
                 state.gpu_type = target
@@ -1057,11 +1111,11 @@ def _handle_key(
             offset = 0
         elif key in (curses.KEY_END, ord("G")):
             offset = counts[pane]
-        if state.rankings:
+        if state.single_panel:
             state.ranking_offsets[state.view] = offset
         else:
             state.offsets[state.gpu_type, pane] = offset
-    if not state.rankings:
+    if not state.single_panel:
         state.pane = pane
     state.clamp(counts, page_height)
     return ""
@@ -1122,6 +1176,72 @@ def _panel_lines(
         state_label = "pending" if states == QUEUED_STATES else "running"
         append(f"No {state_label} {gpu_type.upper()} jobs")
     return lines, job_count
+
+
+def _node_lines(snapshot: Snapshot, width: int, current_user: str, now: float) -> list[PanelLine]:
+    """H200 node inventory and actual per-node job allocations."""
+    nodes = {node.name: node for node in snapshot.nodes if node.total.get("h200", 0)}
+    grouped: dict[str, list[tuple[Job, list[Allocation]]]] = {name: [] for name in nodes}
+    for job in snapshot.jobs:
+        if job.state.upper() not in RUNNING_STATES:
+            continue
+        local: dict[str, list[Allocation]] = {}
+        for allocation in snapshot.allocations.get(job.job_id, []):
+            node = nodes.get(allocation.node)
+            if node is not None and (
+                allocation.gpu_type == "h200"
+                or (allocation.gpu_type == "any" and len(node.total) == 1)
+            ):
+                local.setdefault(node.name, []).append(allocation)
+        for name, allocations in local.items():
+            grouped[name].append((job, allocations))
+
+    lines: list[PanelLine] = []
+
+    def append(text: str, own: bool = False, heading: bool = False, remaining: float | None = None):
+        lines.extend(PanelLine(part, own, heading, remaining) for part in _wrap_line(text, width))
+
+    ordered = sorted(nodes.values(), key=lambda node: (
+        not _node_is_schedulable(node.state), -node.idle("h200"), node.name,
+    ))
+    for node in ordered:
+        if lines:
+            append("")
+        used = node.allocated.get("h200", 0)
+        append(f"{node.name}  |  free {node.free('h200')}/{node.total['h200']}  used {used}  |  {node.state}", heading=True)
+        if not _node_is_schedulable(node.state):
+            append("  Unavailable for new jobs (node state)")
+        visible = 0
+        for job, allocations in sorted(grouped[node.name], key=lambda row: _finish_key(row[0], now)):
+            count = sum(allocation.count for allocation in allocations)
+            visible += count
+            ids = ",".join(allocation.indices for allocation in allocations)
+            own = job.user == current_user
+            who = f"{job.user} (you)" if own else job.user
+            prefix = f"  GPU {ids} ({count})  {who} [{job.job_id}]"
+            end = _timestamp(job.end)
+            remaining = max(0, end - now) if math.isfinite(end) else _remaining_seconds(job.left)
+            timing = f"end in {_duration_label(remaining)}"
+            if job.state.upper() == "COMPLETING":
+                timing = "completing / releasing"
+                remaining = None
+            available = width - _display_width(prefix) - _display_width(timing) - 4
+            if available >= 4:
+                text = prefix + "  " + _clip_text(job.name, available)
+                text += " " * (width - _display_width(text) - _display_width(timing))
+                lines.append(PanelLine(text + timing, own=own, remaining_seconds=remaining, remaining_start=len(text)))
+            else:
+                append(f"{prefix}  {job.name}", own)
+                append(f"    {timing}", own, remaining=remaining)
+        if visible < used:
+            append(f"  {used - visible} allocated GPU(s): job details unavailable")
+        elif visible > used:
+            append("  Allocation totals changed during refresh; awaiting next snapshot")
+        elif used == 0:
+            append("  No allocated GPUs")
+    if not nodes:
+        append("No H200 nodes reported by Slurm")
+    return lines
 
 
 def _podium_visible(state: ViewState) -> bool:
@@ -1581,13 +1701,14 @@ def _clip_text(text: str, width: int) -> str:
 def _gpu_footer(state: ViewState, width: int) -> tuple[str, str]:
     keys = {gpu: key for key, gpu in _gpu_shortcuts(state.gpu_types).items()}
     labels = {gpu: f"{keys[gpu]}:{gpu.upper()}" if gpu in keys else gpu.upper() for gpu in state.gpu_types}
-    selected = {"live": "0:LIVE", "history": "t:TOTAL"}.get(state.view, labels[state.gpu_type])
-    footer = "  ".join(labels[gpu] for gpu in state.gpu_types) + "  0:LIVE  t:TOTAL  [/]/g:view"
+    selected = {"nodes": "n:NODES", "live": "0:LIVE", "history": "t:TOTAL"}.get(state.view, labels[state.gpu_type])
+    footer = "  ".join(labels[gpu] for gpu in state.gpu_types) + "  n:NODES  0:LIVE  t:TOTAL  [/]/g:view"
     if _display_width(footer) > width:
-        footer = (
-            "0:LIVE t:TOTAL [/]/g:view" if state.rankings
-            else f"{selected} 0:LIVE t:TOTAL g:view"
-        )
+        footer = "n:NODES 0:LIVE t:TOTAL g:view"
+        if not state.single_panel:
+            footer = f"{selected} " + footer
+        if _display_width(footer) > width:
+            footer = f"{selected} n:nodes g:view" if not state.single_panel else f"{selected} g:view"
     return footer, selected
 
 
@@ -1630,10 +1751,10 @@ def _draw_screen(
     screen.erase()
     if width < 30 or height < 8:
         _write(screen, 0, 0, "Resize to at least 30×8", width, curses.A_BOLD)
-        _write(screen, height - 1, 0, "0:LIVE t:TOTAL g:view q:quit", width)
+        _write(screen, height - 1, 0, "n:NODES g:view q:quit", width)
         screen.refresh()
         return
-    gpu = state.gpu_type
+    gpu = "h200" if state.view == "nodes" else state.gpu_type
     inventory = (
         f"idle {snapshot.idle.get(gpu, 0)}/{snapshot.total.get(gpu, 0)}  active {snapshot.active.get(gpu, 0)}"
         if snapshot else "Loading Slurm jobs…"
@@ -1643,6 +1764,7 @@ def _draw_screen(
     title = {
         "live": "sinner-top  LIVE RANKING  |  current GPU use",
         "history": "sinner-top  ALL-TIME RANKING  |  cumulative GPU hours",
+        "nodes": f"sinner-top  H200 NODES  |  {inventory}",
     }.get(state.view, f"sinner-top  {gpu.upper()}  |  {inventory}")
     _write(screen, 0, 0, title, width, title_attr)
     updated_label = time.strftime("%H:%M:%S", time.localtime(updated)) if updated else "--:--:--"
@@ -1662,8 +1784,10 @@ def _draw_screen(
         _draw_heroes(screen, state, history, current_user, podium_attrs, own_attr, shine_attr, hero_palettes)
     label_y = 2
     page_height = height - 6
-    if state.rankings:
+    if state.single_panel:
         label = "ACCOUNTS / USERS — GPU HOURS" if state.view == "history" else "ACCOUNTS / USERS — GPUs IN USE"
+        if state.view == "nodes":
+            label = "NODE / GPU / USER / JOB — time to Slurm limit"
         if state.view == "history" and state.history_page == "rest":
             label = "RANK #4+ / USERS — GPU HOURS"
         layout = [(label, panels[0][0], 0, width)]
@@ -1685,7 +1809,7 @@ def _draw_screen(
                 attr |= curses.A_BOLD
             _write(screen, row, start, line.text, pane_width, attr)
             if line.remaining_seconds is not None and remaining_attrs:
-                timing = line.text.lstrip()
+                timing = line.text.lstrip() if line.remaining_start is None else line.text[line.remaining_start:]
                 indent = _display_width(line.text) - _display_width(timing)
                 # Keep the user's highlight in the row margins. Draw the time
                 # on the terminal background so green text stays readable.
@@ -1694,14 +1818,14 @@ def _draw_screen(
                     _display_width(timing),
                     remaining_attrs[_duration_color(line.remaining_seconds)],
                 )
-    if not state.rankings:
+    if not state.single_panel:
         for row in range(2, height - 3):
             _write(screen, row, left_width, "│", 1, curses.A_DIM)
     pane = state.focused_pane
     count = len(panels[pane][0])
     first = state.offset(pane) + 1 if count else 0
     last = min(state.offset(pane) + page_height, count)
-    label = {"history": "Total", "live": "Live"}.get(state.view, ("Running", "Pending")[pane])
+    label = {"nodes": "Nodes", "history": "Total", "live": "Live"}.get(state.view, ("Running", "Pending")[pane])
     status = f"{label} lines {first}–{last}/{count}  |  PgUp/PgDn Home/End"
     if podium:
         status = "PODIUM 1-3  |  Down/j: next page (#4+)  Enter: full details"
@@ -1715,12 +1839,14 @@ def _draw_screen(
     controls = "←/h →/l pane  ↑/k ↓/j 5 lines  r:refresh  q:quit"
     if state.rankings:
         controls = "h:live l:total  ↑/k ↓/j 5 lines  0/t:back  r:refresh  q:quit"
+    if state.view == "nodes":
+        controls = "↑/k ↓/j 5 lines  n:back  h:running l:pending  r:refresh  q:quit"
     if state.view == "history":
         effects = "pause" if state.effects else "play"
         controls = (f"h:live  e:{effects} FX  m:art  t:back  r:refresh  q:quit" if podium
                     else "↑/k ↓/j 5 lines  b:podium  h:live  t:back  r:refresh  q:quit")
     if width < _display_width(controls):
-        controls = {"history": "j/k:5 e:FX m:art t:back q:quit", "live": "j/k:5 l:total 0:back q:quit"}.get(state.view, "h/l:pane j/k:5lines q:quit")
+        controls = {"nodes": "j/k:5 n:back r:refresh q:quit", "history": "j/k:5 e:FX m:art t:back q:quit", "live": "j/k:5 l:total 0:back q:quit"}.get(state.view, "h/l:pane j/k:5lines q:quit")
     _write(screen, height - 2, 0, controls, width, curses.A_DIM)
     footer, selected = _gpu_footer(state, width)
     _write(screen, height - 1, 0, footer, width)
@@ -1835,6 +1961,9 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
             elif state.view == "live":
                 panels = [(_ranking_lines(snapshot, max(2, width), current_user)
                            if snapshot else [PanelLine("Loading Slurm jobs…")], 0)]
+            elif state.view == "nodes":
+                panels = [(_node_lines(snapshot, max(2, width), current_user, now)
+                           if snapshot else [PanelLine("Loading Slurm nodes…")], 0)]
             else:
                 panels = [
                     _panel_lines(

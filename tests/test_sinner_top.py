@@ -178,15 +178,17 @@ class SinnerTopChecks(unittest.TestCase):
         state = m.ViewState(gpu_types=["h200", "h100", "24gb", "47gb", "any"])
         state.offsets["h200", 0] = 4
         visited = []
-        for _ in range(len(state.gpu_types) + 2):
-            visited.append(state.view if state.rankings else state.gpu_type)
+        for _ in range(len(state.gpu_types) + 3):
+            visited.append(state.view if state.single_panel else state.gpu_type)
             m._handle_key(state, ord("g"), 10, [100, 100])
-        self.assertEqual(visited, state.gpu_types + ["live", "history"])
+        self.assertEqual(visited, state.gpu_types + ["nodes", "live", "history"])
         self.assertEqual(state.offset(0), 4)
         m._handle_key(state, ord("["), 10, [100, 100])
         self.assertEqual(state.view, "history")
         m._handle_key(state, ord("["), 10, [100, 100])
         self.assertEqual(state.view, "live")
+        m._handle_key(state, ord("["), 10, [100, 100])
+        self.assertEqual(state.view, "nodes")
         m._handle_key(state, ord("["), 10, [100, 100])
         self.assertEqual(state.gpu_type, "any")
         m._handle_key(state, ord("3"), 10, [100, 100])
@@ -215,6 +217,92 @@ class SinnerTopChecks(unittest.TestCase):
             snap = m.collect_snapshot()
         self.assertTrue(any("%a" in part for part in run.call_args_list[0].args[0]))
         self.assertEqual(snap.jobs[0].account, "lab-a")
+
+    def test_node_inventory_preserves_free_and_unavailable_capacity(self):
+        text = (
+            "NodeName=n1 State=MIXED CfgTRES=gres/gpu=8,gres/gpu:h200=8 AllocTRES=gres/gpu=3\n"
+            "NodeName=n2 State=MIXED+DRAIN CfgTRES=gres/gpu=8,gres/gpu:h200=8 AllocTRES=gres/gpu=2,gres/gpu:h200=2\n"
+            "NodeName=n3 State=IDLE CfgTRES=gres/gpu=4,gres/gpu:h100=4 AllocTRES=\n"
+        )
+        with patch.object(m, "_run", side_effect=["", text, ""]):
+            snap = m.collect_snapshot()
+        self.assertEqual(snap.idle["h200"], 5)
+        self.assertEqual(snap.total["h200"], 16)
+        self.assertEqual((snap.nodes[1].free("h200"), snap.nodes[1].idle("h200")), (6, 0))
+        lines = m._node_lines(snap, 80, "alice", NOW)
+        report = "\n".join(line.text for line in lines)
+        self.assertIn("n1  |  free 5/8  used 3", report)
+        self.assertIn("n2  |  free 6/8  used 2", report)
+        self.assertIn("Unavailable for new jobs", report)
+        self.assertIn("3 allocated GPU(s): job details unavailable", report)
+        self.assertNotIn("n3", report)
+
+    def test_node_jobs_arrays_multi_host_and_local_gpu_counts(self):
+        self.assertEqual(m.expand_nodelist("n[01-02,04],n06"), ["n01", "n02", "n04", "n06"])
+        self.assertEqual(m.expand_nodelist("rack[1-2]n[1-2],n9"), ["rack1n1", "rack1n2", "rack2n1", "rack2n2", "n9"])
+        details = (
+            "JobId=99 ArrayJobId=42 ArrayTaskId=1\n Nodes=n[01-02],n04 GRES=gpu:h200:2(IDX:0-1)\n"
+            "JobId=100 ArrayJobId=42 ArrayTaskId=2\n Nodes=n01 GRES=gpu:1(IDX:2)\n"
+        )
+        jobs = [job("42_1", left="12:00:00"), job("42_2", user="bob", left="30:00"), job("43", state="PENDING")]
+        nodes = [m.NodeInventory(name, "MIXED", {"h200": 8}, {"h200": 3 if name == "n01" else 2}) for name in ("n01", "n02", "n04")]
+        snap = replace(snapshot(jobs), nodes=nodes, allocations=m.parse_job_allocations(details))
+        lines = m._node_lines(snap, 120, "alice", NOW)
+        report = "\n".join(line.text for line in lines)
+        self.assertEqual(report.count("[42_1]"), 3)
+        self.assertEqual(report.count("[42_2]"), 1)
+        self.assertNotIn("[43]", report)
+        self.assertNotIn("unavailable", report)
+        # Free capacity determines node ordering; jobs finish soonest first within a node.
+        self.assertLess(report.index("n02"), report.index("n01"))
+        final_node = report[report.index("n01"):]
+        self.assertLess(final_node.index("[42_2]"), final_node.index("[42_1]"))
+        self.assertIn("GPU 0-1 (2)", final_node)
+        self.assertTrue(all(line.own for line in lines if "[42_1]" in line.text))
+        self.assertFalse(any(line.own for line in lines if "[42_2]" in line.text))
+
+    def test_node_screen_countdowns_resize_and_unavailable_details(self):
+        nodes = [m.NodeInventory("node1", "MIXED", {"h200": 8}, {"h200": 3})]
+        jobs = [job(end="2026-09-04T13:00:01"), job("43", left="UNLIMITED"), job("44", state="COMPLETING")]
+        allocations = {row.job_id: [m.Allocation("node1", "h200", 1, str(index))] for index, row in enumerate(jobs)}
+        snap = replace(snapshot(jobs), nodes=nodes, allocations=allocations)
+        attrs = {"32": 301, "33": 302, "31": 303, "2": 304}
+        for width, height in ((120, 30), (80, 24), (40, 12), (30, 8)):
+            lines = m._node_lines(snap, width, "alice", NOW)
+            self.assertTrue(all(m._display_width(line.text) <= width for line in lines))
+            screen = Screen(height, width)
+            state = m.ViewState(view="nodes", gpu_type="h100")
+            m._draw_screen(screen, state, [(lines, 0)], snap, "alice", 5, NOW, "", False,
+                           curses.A_BOLD, curses.A_REVERSE, attrs)
+            self.assertTrue(any("H200 NODES" in text for y, x, text, attr in screen.writes))
+            self.assertFalse(any(text == "│" for y, x, text, attr in screen.writes))
+            for y, x, text, attr in screen.writes:
+                if attr in attrs.values():
+                    self.assertNotIn("alice", text)
+                    self.assertNotIn("GPU", text)
+        for now, color in ((NOW, "33"), (NOW + 1, "32")):
+            lines = m._node_lines(snap, 120, "alice", now)
+            first = next(line for line in lines if "[42_1]" in line.text)
+            self.assertEqual(m._duration_color(first.remaining_seconds), color)
+        self.assertIn("completing / releasing", "\n".join(line.text for line in lines))
+        self.assertIn("No H200 nodes", m._node_lines(snapshot([]), 80, "alice", NOW)[0].text)
+
+    def test_node_navigation_preserves_job_and_node_positions(self):
+        state = m.ViewState(gpu_type="h100", pane=1)
+        state.offsets["h100", 1] = 15
+        m._handle_key(state, ord("n"), 10, [100, 100])
+        self.assertEqual(state.view, "nodes")
+        self.assertEqual(state.focused_pane, 0)
+        m._handle_key(state, curses.KEY_DOWN, 10, [40])
+        self.assertEqual(state.offset(0), 5)
+        m._handle_key(state, ord("n"), 10, [40])
+        self.assertEqual((state.view, state.gpu_type, state.pane, state.offset(1)), ("jobs", "h100", 1, 15))
+        m._handle_key(state, ord("n"), 10, [100, 100])
+        self.assertEqual(state.offset(0), 5)
+        m._handle_key(state, ord("j"), 10, [40])
+        self.assertEqual(state.offset(0), 10)
+        m._handle_key(state, ord("h"), 10, [40])
+        self.assertEqual((state.view, state.pane), ("jobs", 0))
 
     def test_account_totals_split_users_and_ignore_pending(self):
         jobs = [

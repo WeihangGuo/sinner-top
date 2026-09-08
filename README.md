@@ -98,6 +98,7 @@ All array tasks are available by scrolling in the interactive interface.
 | Number keys shown in the footer | Select a GPU type directly |
 | `0` / `a` | Open Live rankings; press again to return to the previous GPU view |
 | `t` | Open the all-time podium; press again to return to the previous GPU view |
+| `n` | Open H200 nodes; press again to return to the previous GPU view |
 | Enter | From the podium, open a full list of all accounts and users |
 | `b` / Backspace | From a historical list, return to the podium and replay its entrance |
 | `e` | Pause/resume the all-time podium animation |
@@ -108,8 +109,8 @@ All array tasks are available by scrolling in the interactive interface.
 When present, `1` selects H100 and `2` selects H200. Other discovered GPU types
 get additional number shortcuts. All types remain reachable with `[` and `]`,
 including when there are more types than available number keys.
-The footer shows `0:LIVE` and `t:TOTAL`. Both ranking pages follow the last GPU
-type when cycling with `[` / `]` / `g`.
+The footer shows `n:NODES`, `0:LIVE` and `t:TOTAL`. The node page and both ranking
+pages follow the last GPU type when cycling with `[` / `]` / `g`.
 
 Your rows use a colored background, or reverse video when colors are disabled.
 The interface honors `NO_COLOR`; use `--color always` to enable colors explicitly.
@@ -119,6 +120,23 @@ one hour through six hours, and **red** above six hours. Unknown remaining
 time is dimmed. Colors follow the live countdown, including when a job crosses
 a threshold between Slurm refreshes. Your own job rows keep their highlight;
 the time text uses the terminal background for contrast.
+
+## H200 nodes
+
+Press **`n`** to see each H200 node's free/total and allocated GPU counts, node
+state, and the jobs occupying its GPUs. Nodes with more schedulable free GPUs
+appear first. Each job shows its allocated GPU IDs and count **on that node**,
+user, job/array-task ID, name, and a colored countdown to its Slurm time limit.
+Jobs within a node are ordered by earliest end time, and your jobs stay highlighted.
+The countdown is a runtime limit; applications may finish earlier. Completing
+jobs are labeled as releasing their resources.
+
+Free GPUs on draining/down nodes are marked unavailable for new jobs. The header's
+`idle` count includes only schedulable nodes. Missing job details are reported
+against Slurm's node allocation totals; they are never counted as free GPUs.
+The page refreshes with the regular job snapshot. Use Up/Down or `k`/`j` to scroll
+five lines, Page Up/Down for a page, and `r` to refresh. Press `n` to return, or
+`h`/`l` to return directly to Running/Pending. The default startup view stays H200 jobs.
 
 ## Account and user rankings
 
