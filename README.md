@@ -140,8 +140,11 @@ list. Your account and user rows keep their highlight.
 Compact values use `kh` for thousands of GPU-hours; `~` marks the rounded
 per-type figures used in small cards. The full lists show the detailed totals.
 
-The memes use original, clean line art: a sunglasses face ("Deal with it"), a
-GPU goblin ("More! More!"), and a coffee-holding dog ("This is fine"). Each enters
+The memes use original, clean line art: a GPU goblin ("More! More!") for first
+place, a sunglasses face ("Deal with it") for second, and a coffee-holding dog
+("This is fine") for third. The winner's account name appears in large ASCII
+letters below its meme. Longer names use narrower letters or wrap; very small
+panes fall back to a compact name label. Each meme enters
 from a different direction, with staggered arrivals and a brief landing burst.
 After the entrance, the faces stay still while stars and light beams move around
 them. Every return to the podium replays the entrance; routine data refreshes

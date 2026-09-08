@@ -105,7 +105,30 @@ HERO_COMPACT_FACES = (
   /| []''',
 )
 HERO_TITLES = ("OVERLORD", "GPU GOBLIN", "STILL FINE")
-HERO_CAPTIONS = ("DEAL WITH IT", "MORE! MORE!", "THIS IS FINE")
+HERO_CAPTIONS = ("MORE! MORE!", "DEAL WITH IT", "THIS IS FINE")
+# Five-row block lettering for the winning account's name.
+ACCOUNT_LETTERS = {
+    "A": "01110/10001/11111/10001/10001", "B": "11110/10001/11110/10001/11110",
+    "C": "01111/10000/10000/10000/01111", "D": "11110/10001/10001/10001/11110",
+    "E": "11111/10000/11110/10000/11111", "F": "11111/10000/11110/10000/10000",
+    "G": "01111/10000/10111/10001/01111", "H": "10001/10001/11111/10001/10001",
+    "I": "11111/00100/00100/00100/11111", "J": "00111/00010/00010/10010/01100",
+    "K": "10001/10010/11100/10010/10001", "L": "10000/10000/10000/10000/11111",
+    "M": "10001/11011/10101/10001/10001", "N": "10001/11001/10101/10011/10001",
+    "O": "01110/10001/10001/10001/01110", "P": "11110/10001/11110/10000/10000",
+    "Q": "01110/10001/10101/10010/01101", "R": "11110/10001/11110/10010/10001",
+    "S": "01111/10000/01110/00001/11110", "T": "11111/00100/00100/00100/00100",
+    "U": "10001/10001/10001/10001/01110", "V": "10001/10001/10001/01010/00100",
+    "W": "10001/10001/10101/11011/10001", "X": "10001/01010/00100/01010/10001",
+    "Y": "10001/01010/00100/00100/00100", "Z": "11111/00010/00100/01000/11111",
+    "0": "01110/10011/10101/11001/01110", "1": "00100/01100/00100/00100/01110",
+    "2": "01110/00001/01110/10000/11111", "3": "11110/00001/01110/00001/11110",
+    "4": "10010/10010/11111/00010/00010", "5": "11111/10000/11110/00001/11110",
+    "6": "01111/10000/11110/10001/01110", "7": "11111/00001/00010/00100/00100",
+    "8": "01110/10001/01110/10001/01110", "9": "01110/10001/01111/00001/11110",
+    "-": "00000/00000/11111/00000/00000", "_": "00000/00000/00000/00000/11111",
+    ".": "00000/00000/00000/00000/00100", "?": "01110/10001/00110/00000/00100",
+}
 HERO_ENTRANCE_SECONDS = 1.8
 HISTORY_INTERVAL = 15 * 60
 HISTORY_TIMEOUT = 120
@@ -1120,6 +1143,26 @@ def _compact_hours(seconds: int) -> str:
     return f"{hours:.1f}h"
 
 
+def _account_banner(name: str, width: int, max_height: int) -> list[str]:
+    """Keep complete letters, condensing or wrapping long account names."""
+    glyphs = [ACCOUNT_LETTERS.get(char, ACCOUNT_LETTERS["?"]).split("/") for char in (name or "?").upper()]
+    glyph_width = 5
+    if len(glyphs) * 6 - 1 > width:
+        glyph_width = 3
+        glyphs = [["".join("1" if "1" in group else "0" for group in (row[:2], row[2:3], row[3:]))
+                   for row in glyph] for glyph in glyphs]
+    per_line = max(1, (width + 1) // (glyph_width + 1))
+    rows = []
+    for start in range(0, len(glyphs), per_line):
+        if rows:
+            rows.append("")
+        rows.extend(" ".join(glyph[y] for glyph in glyphs[start:start + per_line]).translate(str.maketrans("01", " #"))
+                    for y in range(5))
+    if len(rows) > max_height or any(len(row) > width for row in rows):
+        return _wrap_line(f"[ {name} ]", width)[:max_height]
+    return rows
+
+
 def _hero_card(
     account: AccountUsage, rank: int, width: int, height: int,
     elapsed: float, current_user: str, memes: bool = True,
@@ -1149,6 +1192,11 @@ def _hero_card(
     else:
         type_text = "  ".join(f"{gpu.upper()}:{_compact_hours(account.usage[gpu])}" for gpu in _ordered_gpu_types(account.usage))
         type_lines = _wrap_line(type_text, inner)[:2]
+    banner = []
+    if rank == 0:
+        minimum_user_rows = (len(users) + 1) // 2 if inner >= 32 else len(users)
+        banner_budget = max(1, height - 4 - len(type_lines) - minimum_user_rows - 5)
+        banner = _account_banner(account.account, inner, banner_budget)
     detail_cols = 1
     if side_details:
         body_height = height - (2 if short_header else 5) - len(type_lines)
@@ -1156,17 +1204,20 @@ def _hero_card(
         art_width = max(9, min(23, inner // 2 - 2))
         detail_width = max(1, inner - art_width - 2)
     else:
-        if height - 5 - len(type_lines) - len(users) < 9 and inner >= 32:
+        reserved = 4 + len(banner)
+        preferred_face_height = 18 if inner >= 44 and height >= 30 else 9
+        if height - reserved - len(type_lines) - len(users) < preferred_face_height and inner >= 32:
             detail_cols = 2
-        user_rows = min((len(users) + detail_cols - 1) // detail_cols, max(1, height - 8 - len(type_lines)))
-        body_height = height - 5 - len(type_lines) - user_rows
+        user_rows = min((len(users) + detail_cols - 1) // detail_cols, max(0, height - reserved - 3 - len(type_lines)))
+        body_height = height - reserved - len(type_lines) - user_rows
         art_width = inner
         detail_width = inner // detail_cols
+    meme_index = 1 - rank if rank < 2 else rank
     if not memes or body_height < 5 or art_width < 11:
-        face = [("[###]-[###]", r"( o\_/o )", "( @__O )")[rank]]
+        face = [("[###]-[###]", r"( o\_/o )", "( @__O )")[meme_index]]
     else:
         source = HERO_FACES if body_height >= 9 and art_width >= 22 else HERO_COMPACT_FACES
-        face = source[rank].splitlines()
+        face = source[meme_index].splitlines()
     face_width = max(map(len, face))
     face = [line.ljust(face_width) for line in face]
     if rank == 0 and memes and art_width >= face_width * 2 + 4 and body_height >= len(face) * 2:
@@ -1249,7 +1300,10 @@ def _hero_card(
             row[start:] = list(_clip_text(detail, detail_width).ljust(detail_width))
         lines.append(PanelLine("|" + "".join(row) + "|", line_own, podium_rank=rank))
     caption = HERO_CAPTIONS[rank] if local >= 0.95 else "POWERING UP..."
-    if not short_header:
+    if banner:
+        lines.extend(PanelLine("|" + _center_label(row, inner) + "|", own, True, podium_rank=rank)
+                     for row in banner)
+    elif not short_header:
         lines.append(PanelLine("|" + _center_label(caption, inner) + "|", podium_rank=rank, flash=impact))
     for y in range(user_rows):
         cells = []
