@@ -9,9 +9,11 @@ displayed with their task IDs.
 In a terminal, use arrows or hjkl to choose a pane and scroll. Press [ or ] to
 cycle through GPU types and rankings (g also advances), or use the
 number keys shown in the footer. H200 is the default. Your jobs are highlighted.
-Press 0 for historical GPU-hours and current account/user rankings side by side.
-The top three get animated ASCII podiums; e pauses/resumes effects. Press q to
-quit. Use --once for a printable snapshot instead.
+Press 0 for a plain live ranking, or t for the all-time GPU-hours podium.
+The winner occupies half the screen and the runners-up share the other half.
+Account and user details are expanded by default. Down/j opens rank 4 onward;
+b returns and replays the hero entrance. Use e to pause effects, m for compact
+faces, and q to quit. Use --once for a printable snapshot instead.
 
 ``squeue`` supplies the live job list and timing estimates. Slurm's compact GRES
 field only reports a GPU type and count, so this script enriches it with
@@ -51,51 +53,60 @@ PREFERRED_GPU_TYPES = ("h200", "h100")
 RUNNING_STATES = {"RUNNING", "COMPLETING"}
 QUEUED_STATES = {"PENDING"}
 RANK_MEDALS = ("🥇", "🥈", "🥉")
-# Terminal portraits adapted from the user-provided images; credits in README.
-MEME_PORTRAITS = (
-    """          .:+*******=-.
-       -*###%%%%%%%%%%@#-.
-     +%%%###%%%%%%%%%%%%%%#=
-   :#%%%%%#%%%%%%%%%%%@%%@%##-
-  -@@@@@@@%%@%@%%%@%#***+#%@%%
- .%%%#+==-----=-:.       :%%%%=
- :%%#*:.                .:*%%%*
- .%%#**:-              -:++#%%+
-  %%%##**+-         -+%#*@*+%%#+
- *%%#%%**%%%*=:..:*%%#++**#*#%*-
- .+%##*##=*=+*#:  +=+.+-:*--**:
-  .=#+..-:-.   :  .     .  .*.:
-   :**-       ..     .      =.
-    :++:  .-*=.:   :-+**-:=#-
-      *#*+#***###+*%#***++*=:
-:.....##%*++########%#-...#-
-##%####*##+::=***==::   :#-
-#*%#%*:*@%%*+::.    .:+#*#%:
-**###-  :####*#****##+=-#@%#:
-###=    =+*=::+++++=:.+%%%%#*.
-+#:    *%%#=        +#%##%##%*.""",
-    """:::--:-.                       :  ::::
-@*%%##=. .. . . ....... ...::::**.##*%
-%%*%##.....:::...--=---.:.. ..-##:*@#%
-##%*@*.-=*=**-=##%#%%*%%#%*#-.*#%:+###
-%%*%#::=##*++=#*%%#%##%%#%%#++%##-.###
-%#@##. :=+##*+%%%#%#@*%@#@###=%*#+.+#%
-%%##+..:-=*%**##%%#%%#%#%##%*####*==*%
-%%#%+..-==--=-:=====#***=**+=-%**#-*#%
-%#%##--:.. ..:-. . .*=:....:..=*%#*%##
-%%*%%*------===.-=:=##*==++-::+##++@##
-##%*%=:++#%######++=#*##**+*#*#*##*%#%
-#%*#*--=+*##*+-:---==+*++-+*#%%#%*+%*#
-%#%%+..-----..... ... ...:.:+#@*##*@#%
-%#%#*. :.:......::::::.:.. .:#%*##*%##
-%#*%+. ..:---.:.:-===---..---#%****@##
-##%#*. . .-=*++*+***#+*+:-++:#%+*#+%##
-%%*#:.......=*+-:-=====-=+=.:%%*#+*@##
-##%#:. ... ...=+*++===+*=-..+#%**+*%#%
-#%#*.... . . ...::.::--:: .:+%###+#%*%
-@%**.. ... .... ..... ......*#@****@#%
-###=............ . .. ...  :*%@**+%###""",
+# Original line-art memes use clear contours instead of photo halftones.
+HERO_FACES = (
+    r'''    .-""""""""-.
+  .'            '.
+ /   _        _   \
+|  [####]--[####]  |
+|        /\       |
+|    .--------.   |
+ \    '------'   /
+  '.            .'
+    '-.______.-'
+'''.strip("\n"),
+    r'''   .-""""""""""-.
+ .'   __    __   '.
+/   _/  \__/  \_  \
+|   \_o_/  \_o_/   |
+|       /__\       |
+|  /|_|_|_|_|_|\  |
+ \ \_|_|_|_|_|_/ /
+  '.  '------' .'
+    '--------'
+'''.strip("\n"),
+    r'''       / \__
+      (    @\___
+      /         O
+     /   (_____/
+    /_____/   U
+       /  \  .-.
+      /    \ | |]
+     /      \'-'
+    (________)''',
 )
+HERO_COMPACT_FACES = (
+    r''' .-----.
+|###+###|
+|   ^   |
+| \___/ |
+ '-----'
+'''.strip("\n"),
+    r''' .-----.
+ /o\_/o\
+| \___/ |
+ \|||||/
+  '---'
+'''.strip("\n"),
+    r''' / \__
+(  @  \_
+/    __o
+\___/ U
+  /| []''',
+)
+HERO_TITLES = ("OVERLORD", "GPU GOBLIN", "STILL FINE")
+HERO_CAPTIONS = ("DEAL WITH IT", "MORE! MORE!", "THIS IS FINE")
+HERO_ENTRANCE_SECONDS = 1.8
 HISTORY_INTERVAL = 15 * 60
 HISTORY_TIMEOUT = 120
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
@@ -888,6 +899,7 @@ class PanelLine:
     heading: bool = False
     remaining_seconds: float | None = None
     podium_rank: int | None = None
+    flash: bool = False
 
 
 @dataclass
@@ -896,49 +908,89 @@ class ViewState:
     gpu_types: list[str] = field(default_factory=lambda: list(PREFERRED_GPU_TYPES))
     pane: int = 0
     offsets: dict[tuple[str, int], int] = field(default_factory=dict)
-    rankings: bool = False
-    ranking_offsets: list[int] = field(default_factory=lambda: [0, 0])
-    ranking_pane: int = 0
+    view: str = "jobs"
+    history_page: str = "podium"
+    ranking_offsets: dict[str, int] = field(default_factory=dict)
     effects: bool = True
     memes: bool = True
+    animation_elapsed: float = 0.0
+    animation_tick: float | None = None
+
+    @property
+    def rankings(self) -> bool:
+        return self.view != "jobs"
 
     @property
     def focused_pane(self) -> int:
-        return self.ranking_pane if self.rankings else self.pane
+        return 0 if self.rankings else self.pane
+
+    def select_view(self, view: str) -> None:
+        if view != self.view:
+            self.view = view
+            if view == "history":
+                self.show_podium()
+
+    def show_podium(self) -> None:
+        self.history_page = "podium"
+        # Start only once history is available; replay on every return.
+        self.animation_tick = None
+        self.animation_elapsed = 0.0 if self.effects else HERO_ENTRANCE_SECONDS
+
+    def animate(self, now: float, ready: bool) -> None:
+        if self.view != "history" or self.history_page != "podium" or not ready:
+            return
+        if self.animation_tick is not None and self.effects:
+            self.animation_elapsed += max(0, now - self.animation_tick)
+        self.animation_tick = now
 
     def offset(self, pane: int) -> int:
         if self.rankings:
-            return self.ranking_offsets[pane]
+            return self.ranking_offsets.get(self.view, 0)
         return self.offsets.get((self.gpu_type, pane), 0)
 
     def clamp(self, counts: Sequence[int], page_height: int) -> None:
-        for pane, count in enumerate(counts):
-            offset = min(
-                max(0, self.offset(pane)), max(0, count - page_height)
-            )
+        for pane, count in enumerate(counts[:1] if self.rankings else counts):
+            offset = min(max(0, self.offset(pane)), max(0, count - page_height))
             if self.rankings:
-                self.ranking_offsets[pane] = offset
+                self.ranking_offsets[self.view] = offset
             else:
                 self.offsets[self.gpu_type, pane] = offset
 
 
 def _handle_key(
-    state: ViewState, key: int, page_height: int, counts: Sequence[int]
+    state: ViewState, key: int, page_height: int, counts: Sequence[int],
 ) -> str:
     if key in (ord("q"), ord("Q")):
         return "quit"
     if key == ord("r"):
         return "refresh"
-    if key in (ord("0"), ord("a")):
-        state.rankings = not state.rankings
+    if key in (ord("0"), ord("a"), ord("t")):
+        target = "history" if key == ord("t") else "live"
+        state.select_view("jobs" if state.view == target else target)
         return ""
-    if key == ord("e") and state.rankings:
+    if key == ord("e") and state.view == "history":
         state.effects = not state.effects
         return ""
-    if key == ord("m") and state.rankings:
+    if key == ord("m") and state.view == "history":
         state.memes = not state.memes
         return ""
+    if state.view == "history":
+        if state.history_page == "podium" and key in (curses.KEY_DOWN, ord("j"), curses.KEY_NPAGE, 4, ord(" "), 10, 13):
+            state.history_page = "all" if key in (10, 13) else "rest"
+            state.ranking_offsets["history"] = 0
+            return ""
+        if key in (ord("b"), curses.KEY_BACKSPACE, 127) or (
+            state.history_page != "podium" and state.offset(0) == 0 and key in (curses.KEY_UP, ord("k"))
+        ):
+            state.show_podium()
+            return ""
     pane = state.focused_pane
+    if state.rankings and key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), ord("\t")):
+        target = "live" if key in (curses.KEY_LEFT, ord("h")) else "history"
+        if key == ord("\t"):
+            target = "live" if state.view == "history" else "history"
+        state.select_view(target)
+        return ""
     if key in (curses.KEY_LEFT, ord("h")):
         pane = 0
     elif key in (curses.KEY_RIGHT, ord("l")):
@@ -947,18 +999,19 @@ def _handle_key(
         pane = 1 - pane
     elif key in (ord("["), ord("]"), ord("g")) or key in range(ord("1"), ord("9") + 1):
         if key in (ord("["), ord("]"), ord("g")):
-            index = len(state.gpu_types) if state.rankings else state.gpu_types.index(state.gpu_type)
-            step = -1 if key == ord("[") else 1
-            next_index = (index + step) % (len(state.gpu_types) + 1)
-            state.rankings = next_index == len(state.gpu_types)
-            if not state.rankings:
-                state.gpu_type = state.gpu_types[next_index]
+            views = state.gpu_types + ["live", "history"]
+            index = views.index(state.view if state.rankings else state.gpu_type)
+            target = views[(index + (-1 if key == ord("[") else 1)) % len(views)]
+            if target in ("live", "history"):
+                state.select_view(target)
+            else:
+                state.gpu_type = target
+                state.select_view("jobs")
         else:
             gpu = _gpu_shortcuts(state.gpu_types).get(chr(key))
             if gpu is not None:
                 state.gpu_type = gpu
-                state.rankings = False
-        # Restore this GPU's scroll positions after its rows have been rebuilt.
+                state.select_view("jobs")
         return ""
     else:
         offset = state.offset(pane)
@@ -966,21 +1019,19 @@ def _handle_key(
             offset += 5
         elif key in (curses.KEY_UP, ord("k")):
             offset -= 5
-        elif key in (curses.KEY_NPAGE, 4):  # Page Down / Ctrl+D
+        elif key in (curses.KEY_NPAGE, 4):
             offset += page_height
-        elif key in (curses.KEY_PPAGE, 21):  # Page Up / Ctrl+U
+        elif key in (curses.KEY_PPAGE, 21):
             offset -= page_height
         elif key == curses.KEY_HOME:
             offset = 0
         elif key in (curses.KEY_END, ord("G")):
             offset = counts[pane]
         if state.rankings:
-            state.ranking_offsets[pane] = offset
+            state.ranking_offsets[state.view] = offset
         else:
             state.offsets[state.gpu_type, pane] = offset
-    if state.rankings:
-        state.ranking_pane = pane
-    else:
+    if not state.rankings:
         state.pane = pane
     state.clamp(counts, page_height)
     return ""
@@ -1043,62 +1094,201 @@ def _panel_lines(
     return lines, job_count
 
 
-def _meme_face(rank: int, width: int) -> list[str]:
-    if rank == 2:
-        # An original toothy grin to round out the two reference portraits.
-        face = r'''
-          .-"""""""""-.
-       .-'  _      _   '-.
-      /   _/ \_  _/ \_    \
-     |   /  o  \/  o  \   |
-     |   \_____/\_____/   |
-     |       / __ \       |
-     |  .---'------'---.   |
-      \  \_|_|_|_|_|_/   /
-       \  \_|_|_|_|_/   /
-        '. '-------'  .'
-          '-._____.-'
-'''.strip("\n").splitlines()
-        if width < 29:
-            face = [" .-------.", "/  o   o  \\", "|    ^    |", "| \\||||/ |", " \\______/ "]
-        return [line.center(min(width, 31)) for line in face]
-    source = [line.ljust(38) for line in MEME_PORTRAITS[rank].splitlines()]
-    columns = min(width, 38)
-    rows = max(1, round(len(source) * columns / 38))
-    # Resample character density, preserving the portrait's terminal aspect.
-    shades = " .:-=+*#%@"
-    result = []
-    for y in range(rows):
-        line = ""
-        for x in range(columns):
-            values = [
-                shades.index(source[sy][sx])
-                for sy in range(y * len(source) // rows, (y + 1) * len(source) // rows)
-                for sx in range(x * 38 // columns, (x + 1) * 38 // columns)
-            ]
-            line += shades[round(sum(values) / len(values))]
-        result.append(line)
-    return result
+def _podium_visible(state: ViewState) -> bool:
+    return state.view == "history" and state.history_page == "podium"
 
 
-def _podium_art(rank: int, width: int, frame: int, memes: bool = True) -> list[str]:
-    """Portraits stay still while sparks and beams sweep around them."""
-    title = ("#1 GPU OVERLORD", "#2 HERE'S MY GPU!", "#3 JUST ONE MORE")[rank]
-    if not memes or width < 18:
-        face = ("(^_^)", "(O_O)", "(>_<)")[rank]
-        return [_clip_text(f"{('*', '+', '.', '*')[frame % 4]} {face} {title}", width)]
-    portrait = _meme_face(rank, width - 4)
-    rows = []
-    for row, center in enumerate([title, *portrait, "- GPU HALL OF FAME -"]):
-        center = _clip_text(center, width - 2)
-        pattern = "=->>===->>==" if row in (0, len(portrait) + 1) else " . * + . *  "
-        phase = (frame * (3 - rank) + row * 2) % len(pattern)
-        left = (pattern[phase:] + pattern[:phase]) * (width // len(pattern) + 1)
-        left_size = (width - len(center) - 2) // 2
-        right_size = width - left_size - len(center) - 2
-        rows.append(left[:left_size] + " " + center + " "
-                    + left[:right_size][::-1].replace(">", "<"))
-    return rows
+def _hero_layout(width: int, height: int) -> list[tuple[int, int, int, int]]:
+    # The winner gets one half; runners-up share the other half vertically.
+    left = (width - 1) // 2
+    body = max(2, height - 5)
+    upper = body // 2
+    return [(0, 2, left, body), (left + 1, 2, width - left - 1, upper),
+            (left + 1, 2 + upper, width - left - 1, body - upper)]
+
+
+def _center_label(text: str, width: int) -> str:
+    text = _clip_text(text, width)
+    space = width - _display_width(text)
+    return " " * (space // 2) + text + " " * (space - space // 2)
+
+
+def _compact_hours(seconds: int) -> str:
+    hours = seconds / 3600
+    if hours >= 1000:
+        return f"{hours / 1000:.1f}kh"
+    return f"{hours:.1f}h"
+
+
+def _hero_card(
+    account: AccountUsage, rank: int, width: int, height: int,
+    elapsed: float, current_user: str, memes: bool = True,
+) -> list[PanelLine]:
+    own = current_user in account.users
+    users = sorted(account.users.items(), key=lambda row: (-sum(row[1].values()), row[0]))
+    hours = sum(account.usage.values()) / 3600
+    total = f"{hours:,.1f} GPU-h"
+    if _display_width(total) > width - 2:
+        total = f"{hours / 1000:.1f}kh" if hours >= 1000 else f"{hours:.1f}h"
+    if height < 8:
+        text = [f"#{rank + 1} {account.account}", total, HERO_CAPTIONS[rank]]
+        return [PanelLine(_center_label(line, width), own, True, podium_rank=rank) for line in text[:height]]
+    inner = width - 2
+    short_header = rank > 0 and height < 13
+    side_details = rank > 0
+    if short_header:
+        parts = []
+        for gpu in _ordered_gpu_types(account.usage):
+            value = account.usage[gpu] / 3600
+            value = f"{value / 1000:.0f}k" if value >= 1000 else f"{value:.0f}"
+            parts.append(f"{gpu.upper()}~{value}")
+        type_text = " ".join(parts)
+        if _display_width(type_text) > inner:
+            type_text = _clip_text(type_text, inner - 1) + "…"
+        type_lines = [type_text]
+    else:
+        type_text = "  ".join(f"{gpu.upper()}:{_compact_hours(account.usage[gpu])}" for gpu in _ordered_gpu_types(account.usage))
+        type_lines = _wrap_line(type_text, inner)[:2]
+    detail_cols = 1
+    if side_details:
+        body_height = height - (2 if short_header else 5) - len(type_lines)
+        user_rows = 0
+        art_width = max(9, min(23, inner // 2 - 2))
+        detail_width = max(1, inner - art_width - 2)
+    else:
+        if height - 5 - len(type_lines) - len(users) < 9 and inner >= 32:
+            detail_cols = 2
+        user_rows = min((len(users) + detail_cols - 1) // detail_cols, max(1, height - 8 - len(type_lines)))
+        body_height = height - 5 - len(type_lines) - user_rows
+        art_width = inner
+        detail_width = inner // detail_cols
+    if not memes or body_height < 5 or art_width < 11:
+        face = [("[###]-[###]", r"( o\_/o )", "( @__O )")[rank]]
+    else:
+        source = HERO_FACES if body_height >= 9 and art_width >= 22 else HERO_COMPACT_FACES
+        face = source[rank].splitlines()
+    face_width = max(map(len, face))
+    face = [line.ljust(face_width) for line in face]
+    if rank == 0 and memes and art_width >= face_width * 2 + 4 and body_height >= len(face) * 2:
+        face = ["".join(char * 2 for char in line) for line in face for _ in range(2)]
+        face_width *= 2
+    local = max(0.0, elapsed - rank * 0.22)
+    impact = 0.65 <= local < 0.95
+    phase = int(elapsed * 7)
+    canvas = [[" "] * inner for _ in range(body_height)]
+
+    def put(y: int, x: int, value: str) -> None:
+        if 0 <= y < body_height:
+            for dx, char in enumerate(value):
+                if 0 <= x + dx < inner:
+                    canvas[y][x + dx] = char
+
+    for n in range(max(4, inner // 5)):
+        y = (n * 3 + phase // 2 + rank) % body_height
+        x = (n * 11 + phase + rank * 5) % inner
+        put(y, x, (".", "+", "*", ".")[(phase + n) % 4])
+    for y in range(body_height):
+        reach = (phase + y) % max(1, (inner - face_width) // 2)
+        put(y, reach, "/" if y < body_height // 2 else "\\")
+        put(y, inner - 1 - reach, "\\" if y < body_height // 2 else "/")
+    if impact:
+        for y in range(body_height):
+            put(y, 0, ">>>" if y % 2 else "***")
+            put(y, inner - 3, "<<<" if y % 2 else "***")
+    progress = min(1.0, local / 0.65)
+    x = (art_width - face_width) // 2
+    y = (body_height - len(face)) // 2
+    if rank == 0:
+        x = round(-face_width + (x + face_width) * progress)
+    elif rank == 1:
+        y = round(-len(face) + (y + len(face)) * progress)
+    else:
+        x = round(inner + (x - inner) * progress)
+    for dy, line in enumerate(face):
+        put(y + dy, x, line)
+    title = f" #{rank + 1} {HERO_TITLES[rank]} "
+    if local < 0.65:
+        title = f" >>> #{rank + 1} INCOMING <<< "
+    elif impact:
+        title = f" *** #{rank + 1} LANDED! *** "
+    text = _clip_text(title, inner)
+    padding = inner - len(text)
+    border = "+" + "=" * (padding // 2) + text + "=" * (padding - padding // 2) + "+"
+    if short_header:
+        header = f"#{rank + 1} {account.account}  {_gpu_hours(sum(account.usage.values()))}h"
+        lines = [PanelLine("+" + _center_label(header, inner) + "+", own, True, podium_rank=rank, flash=impact)]
+    else:
+        lines = [
+            PanelLine(border, podium_rank=rank, flash=impact),
+            PanelLine("|" + _center_label(account.account, inner) + "|", own, True, podium_rank=rank),
+            PanelLine("|" + _center_label(total, inner) + "|", podium_rank=rank),
+        ]
+    lines.extend(PanelLine("|" + _center_label(line, inner) + "|", podium_rank=rank) for line in type_lines)
+
+    def user_label(index, user, usage, columns):
+        who = f"{user} (you)" if user == current_user else user
+        hours = f"{_gpu_hours(sum(usage.values()))}h"
+        text = f"{index}. {who}  {hours}"
+        if _display_width(text) > columns:
+            text = f"{index}. {who} {_compact_hours(sum(usage.values()))}"
+        return _clip_text(text, columns)
+
+    for y, row in enumerate(canvas):
+        line_own = False
+        if side_details:
+            start = art_width + 2
+            # Account members are visible by default alongside the meme.
+            detail = ""
+            if y < len(users):
+                user, usage = users[y]
+                detail = user_label(y + 1, user, usage, detail_width)
+                line_own = user == current_user
+            if y == body_height - 1 and len(users) > body_height:
+                detail = f"+{len(users) - y} more (Enter)"
+                line_own = False
+            row[start:] = list(_clip_text(detail, detail_width).ljust(detail_width))
+        lines.append(PanelLine("|" + "".join(row) + "|", line_own, podium_rank=rank))
+    caption = HERO_CAPTIONS[rank] if local >= 0.95 else "POWERING UP..."
+    if not short_header:
+        lines.append(PanelLine("|" + _center_label(caption, inner) + "|", podium_rank=rank, flash=impact))
+    for y in range(user_rows):
+        cells = []
+        line_own = False
+        for column in range(detail_cols):
+            index = y + column * user_rows
+            text = ""
+            if index < len(users):
+                user, usage = users[index]
+                text = user_label(index + 1, user, usage, detail_width)
+                line_own |= user == current_user
+            if y == user_rows - 1 and column == detail_cols - 1 and len(users) > user_rows * detail_cols:
+                text = f"+{len(users) - index} more (Enter)"
+            cells.append(_center_label(text, detail_width))
+        lines.append(PanelLine("|" + _center_label("".join(cells), inner) + "|", line_own, podium_rank=rank))
+    beam = ("==->>==" if phase % 2 else "->>====") * (width // 7 + 1)
+    bottom = _center_label(caption, inner) if short_header else beam[:inner]
+    lines.append(PanelLine("+" + bottom + "+", podium_rank=rank, flash=impact))
+
+    return lines
+
+
+def _draw_heroes(screen, state, history, current_user, podium_attrs, own_attr, shine_attr):
+    if history is None or not history.accounts:
+        return
+    height, width = screen.getmaxyx()
+    for rank, (start, top, card_width, card_height) in enumerate(_hero_layout(width, height)):
+        if rank >= len(history.accounts):
+            _write(screen, top, start, f"#{rank + 1} — no GPU usage", card_width, curses.A_DIM)
+            continue
+        account = history.accounts[rank]
+        lines = _hero_card(account, rank, card_width, card_height, state.animation_elapsed, current_user, state.memes)
+        for y, line in enumerate(lines, top):
+            attr = podium_attrs[rank] if podium_attrs else curses.A_BOLD
+            if line.flash:
+                attr = shine_attr
+            if line.own:
+                attr = own_attr | curses.A_BOLD
+            _write(screen, y, start, line.text, card_width, attr)
 
 
 def _gpu_hours(seconds: int) -> str:
@@ -1107,7 +1297,7 @@ def _gpu_hours(seconds: int) -> str:
 
 def _usage_ranking_lines(
     accounts: Sequence[AccountUsage], width: int, current_user: str,
-    *, historical: bool = False, frame: int = 0, memes: bool = True,
+    *, historical: bool = False, start_rank: int = 0,
 ) -> list[PanelLine]:
     lines: list[PanelLine] = []
 
@@ -1126,7 +1316,7 @@ def _usage_ranking_lines(
             return _usage_label(usage)
         return "  ".join(f"{gpu.upper()}:{_gpu_hours(usage[gpu])}h" for gpu in _ordered_gpu_types(usage))
 
-    for index, row in enumerate(accounts):
+    for index, row in enumerate(accounts, start_rank):
         if lines:
             append("")
         append(
@@ -1134,16 +1324,12 @@ def _usage_ranking_lines(
             current_user in row.users, True, index if index < 3 else None,
         )
         append(f"   {breakdown(row.usage)}", current_user in row.users)
-        if index < 3:
-            for art in _podium_art(index, width, frame, memes):
-                append(art, rank=index)
         users = sorted(row.users.items(), key=lambda item: (-sum(item[1].values()), item[0]))
         for user_index, (user, usage) in enumerate(users):
             branch = "└─" if user_index == len(users) - 1 else "├─"
             who = f"{user} (you)" if user == current_user else user
             append(
-                f"  {branch} {rank_label(user_index)} {who}  {total_label(usage)}"
-                + (f"  {('*', '+', '*', '.')[frame % 4]}<<" if user_index < 3 else ""),
+                f"  {branch} {rank_label(user_index)} {who}  {total_label(usage)}",
                 user == current_user, rank=user_index if user_index < 3 else None,
             )
             if len(usage) > 1:
@@ -1154,14 +1340,14 @@ def _usage_ranking_lines(
 
 
 def _ranking_lines(
-    snapshot: Snapshot, width: int, current_user: str, frame: int = 0, memes: bool = True,
+    snapshot: Snapshot, width: int, current_user: str,
 ) -> list[PanelLine]:
-    return _usage_ranking_lines(_account_rankings(snapshot), width, current_user, frame=frame, memes=memes)
+    return _usage_ranking_lines(_account_rankings(snapshot), width, current_user)
 
 
 def _history_lines(
     history: HistorySnapshot | None, width: int, current_user: str,
-    frame: int = 0, error: str = "", loading: bool = False, memes: bool = True,
+    error: str = "", loading: bool = False, start_rank: int = 0,
 ) -> list[PanelLine]:
     intro = ["GPU-hours = GPUs x elapsed hours"]
     if history is not None:
@@ -1178,7 +1364,11 @@ def _history_lines(
     lines = [PanelLine(part) for line in intro for part in _wrap_line(line, width)]
     if history is not None:
         lines.append(PanelLine(""))
-        lines.extend(_usage_ranking_lines(history.accounts, width, current_user, historical=True, frame=frame, memes=memes))
+        if start_rank and len(history.accounts) <= start_rank:
+            lines.append(PanelLine("No accounts below the top three. Enter on the podium shows all users."))
+        else:
+            lines.extend(_usage_ranking_lines(history.accounts[start_rank:], width, current_user,
+                                            historical=True, start_rank=start_rank))
     return lines
 
 
@@ -1228,12 +1418,12 @@ def _clip_text(text: str, width: int) -> str:
 def _gpu_footer(state: ViewState, width: int) -> tuple[str, str]:
     keys = {gpu: key for key, gpu in _gpu_shortcuts(state.gpu_types).items()}
     labels = {gpu: f"{keys[gpu]}:{gpu.upper()}" if gpu in keys else gpu.upper() for gpu in state.gpu_types}
-    selected = "0:RANK" if state.rankings else labels[state.gpu_type]
-    footer = "  ".join(labels[gpu] for gpu in state.gpu_types) + "  0:RANK  [/]/g:view"
+    selected = {"live": "0:LIVE", "history": "t:TOTAL"}.get(state.view, labels[state.gpu_type])
+    footer = "  ".join(labels[gpu] for gpu in state.gpu_types) + "  0:LIVE  t:TOTAL  [/]/g:view"
     if _display_width(footer) > width:
         footer = (
-            "0:RANK  0:back  [/]/g:view" if state.rankings
-            else f"{selected}  0:RANK  [/]/g:view"
+            "0:LIVE t:TOTAL [/]/g:view" if state.rankings
+            else f"{selected} 0:LIVE t:TOTAL g:view"
         )
     return footer, selected
 
@@ -1267,12 +1457,16 @@ def _draw_screen(
     own_attr: int,
     remaining_attrs: dict[str, int] | None = None,
     podium_attrs: Sequence[int] = (),
+    history: HistorySnapshot | None = None,
+    shine_attr: int = curses.A_BOLD,
+    history_error: str = "",
+    history_loading: bool = False,
 ) -> None:
     height, width = screen.getmaxyx()
     screen.erase()
     if width < 30 or height < 8:
         _write(screen, 0, 0, "Resize to at least 30×8", width, curses.A_BOLD)
-        _write(screen, height - 1, 0, "0:RANK [/]/g:view q:quit", width)
+        _write(screen, height - 1, 0, "0:LIVE t:TOTAL g:view q:quit", width)
         screen.refresh()
         return
     gpu = state.gpu_type
@@ -1282,28 +1476,44 @@ def _draw_screen(
     )
     if gpu == "any" and snapshot and gpu not in snapshot.total:
         inventory = "GPU type unspecified"
-    title = (
-        "sinner-top  ACCOUNT RANKINGS  |  all GPU types"
-        if state.rankings else f"sinner-top  {gpu.upper()}  |  {inventory}"
-    )
+    title = {
+        "live": "sinner-top  LIVE RANKING  |  current GPU use",
+        "history": "sinner-top  ALL-TIME RANKING  |  cumulative GPU hours",
+    }.get(state.view, f"sinner-top  {gpu.upper()}  |  {inventory}")
     _write(screen, 0, 0, title, width, title_attr)
     updated_label = time.strftime("%H:%M:%S", time.localtime(updated)) if updated else "--:--:--"
-    _write(screen, 1, 0, f"Updated {updated_label}  refresh {interval:g}s  |  you: {current_user} (highlighted)", width, curses.A_DIM)
+    meta = f"Updated {updated_label}  refresh {interval:g}s  |  you: {current_user} (highlighted)"
+    if state.view == "history":
+        meta = f"you: {current_user} (highlighted)  |  all GPU types  |  GPUs x elapsed hours"
+        if history is not None:
+            since = history.earliest[:10] if history.earliest else "unknown"
+            date = time.strftime("%m-%d %H:%M", time.localtime(history.updated))
+            meta = f"you: {current_user}  |  retained since {since}  |  as of {date} (refresh 15m)"
+    _write(screen, 1, 0, meta, width, curses.A_DIM)
     left_width = (width - 1) // 2
     widths = (left_width, width - left_width - 1)
     starts = (0, left_width + 1)
+    podium = _podium_visible(state) and history is not None and bool(history.accounts)
+    if podium:
+        _draw_heroes(screen, state, history, current_user, podium_attrs, own_attr, shine_attr)
+    label_y = 2
     page_height = height - 6
-    labels = ("ALL-TIME GPU HOURS", "CURRENT GPU USE") if state.rankings else ("RUNNING", "PENDING")
-    layout = [
-        (labels[pane], lines, starts[pane], widths[pane])
-        for pane, (lines, _) in enumerate(panels)
-    ]
-    for pane, (label, lines, start, pane_width) in enumerate(layout):
+    if state.rankings:
+        label = "ACCOUNTS / USERS — GPU HOURS" if state.view == "history" else "ACCOUNTS / USERS — GPUs IN USE"
+        if state.view == "history" and state.history_page == "rest":
+            label = "RANK #4+ / USERS — GPU HOURS"
+        layout = [(label, panels[0][0], 0, width)]
+    else:
+        layout = [
+            (("RUNNING", "PENDING")[pane], lines, starts[pane], widths[pane])
+            for pane, (lines, _) in enumerate(panels)
+        ]
+    for pane, (label, lines, start, pane_width) in enumerate([] if podium else layout):
         focused = state.focused_pane == pane
         attr = title_attr | (curses.A_REVERSE if focused else 0)
-        _write(screen, 2, start, f"{'>' if focused else ' '} {label}", pane_width, attr)
+        _write(screen, label_y, start, f"{'>' if focused else ' '} {label}", pane_width, attr)
         visible = lines[state.offset(pane):state.offset(pane) + page_height]
-        for row, line in enumerate(visible, 3):
+        for row, line in enumerate(visible, label_y + 1):
             attr = own_attr if line.own else 0
             if not line.own and line.podium_rank is not None:
                 attr = podium_attrs[line.podium_rank] if podium_attrs else curses.A_BOLD
@@ -1320,14 +1530,19 @@ def _draw_screen(
                     _display_width(timing),
                     remaining_attrs[_duration_color(line.remaining_seconds)],
                 )
-    for row in range(2, height - 3):
-        _write(screen, row, left_width, "│", 1, curses.A_DIM)
+    if not state.rankings:
+        for row in range(2, height - 3):
+            _write(screen, row, left_width, "│", 1, curses.A_DIM)
     pane = state.focused_pane
     count = len(panels[pane][0])
     first = state.offset(pane) + 1 if count else 0
     last = min(state.offset(pane) + page_height, count)
-    label = ("History", "Current")[pane] if state.rankings else ("Running", "Pending")[pane]
+    label = {"history": "Total", "live": "Live"}.get(state.view, ("Running", "Pending")[pane])
     status = f"{label} lines {first}–{last}/{count}  |  PgUp/PgDn Home/End"
+    if podium:
+        status = "PODIUM 1-3  |  Down/j: next page (#4+)  Enter: full details"
+    if state.view == "history":
+        error, loading = history_error, history_loading
     if error:
         status = f"Slurm: {error}  (r: retry)"
     elif loading:
@@ -1335,10 +1550,13 @@ def _draw_screen(
     _write(screen, height - 3, 0, status, width, curses.A_DIM)
     controls = "←/h →/l pane  ↑/k ↓/j 5 lines  r:refresh  q:quit"
     if state.rankings:
+        controls = "h:live l:total  ↑/k ↓/j 5 lines  0/t:back  r:refresh  q:quit"
+    if state.view == "history":
         effects = "pause" if state.effects else "play"
-        controls = f"←/h →/l pane  ↑/k ↓/j 5 lines  e:{effects} FX  m:memes  0:back  r:refresh  q:quit"
+        controls = (f"h:live  e:{effects} FX  m:art  t:back  r:refresh  q:quit" if podium
+                    else "↑/k ↓/j 5 lines  b:podium  h:live  t:back  r:refresh  q:quit")
     if width < _display_width(controls):
-        controls = "h/l:pane j/k:5 e:FX m:art q:quit" if state.rankings else "h/l:pane j/k:5lines q:quit"
+        controls = {"history": "j/k:5 e:FX m:art t:back q:quit", "live": "j/k:5 l:total 0:back q:quit"}.get(state.view, "h/l:pane j/k:5lines q:quit")
     _write(screen, height - 2, 0, controls, width, curses.A_DIM)
     footer, selected = _gpu_footer(state, width)
     _write(screen, height - 1, 0, footer, width)
@@ -1358,6 +1576,7 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
     own_attr = curses.A_REVERSE
     remaining_attrs: dict[str, int] = {}
     podium_attrs: list[int] = []
+    shine_attr = curses.A_BOLD | curses.A_REVERSE
     if use_color and curses.has_colors():
         curses.start_color()
         background = curses.COLOR_BLACK
@@ -1384,6 +1603,8 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
         for pair, foreground in enumerate(podium_colors, 6):
             curses.init_pair(pair, foreground, background)
             podium_attrs.append(curses.A_BOLD | curses.color_pair(pair))
+        curses.init_pair(9, curses.COLOR_WHITE, background)
+        shine_attr = curses.A_BOLD | curses.color_pair(9)
     state = ViewState(gpu_type=args.gpu)
     loader = SnapshotLoader()
     history_loader = SnapshotLoader(collect_history)
@@ -1412,7 +1633,7 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
             if fresh_history is not None:
                 history = fresh_history
             next_history_refresh = time.time() + HISTORY_INTERVAL
-        if state.rankings and time.time() >= next_history_refresh:
+        if state.view == "history" and time.time() >= next_history_refresh:
             history_loader.request()
             next_history_refresh = time.time() + HISTORY_INTERVAL
         if time.monotonic() >= next_refresh:
@@ -1420,18 +1641,18 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
             next_refresh = time.monotonic() + args.interval
         height, width = screen.getmaxyx()
         now = time.time()
-        frame = int(time.monotonic() * 5) % 12 if state.rankings and state.effects else 0
-        key = (id(snapshot), id(history), state.gpu_type, state.rankings, width,
-               int(now), frame, state.memes, history_error, history_loader.running)
+        state.animate(time.monotonic(), history is not None)
+        key = (id(snapshot), id(history), state.gpu_type, state.view, state.history_page, width,
+               int(now), state.memes, history_error, history_loader.running)
         if key != cache_key:
             left_width = max(2, (width - 1) // 2)
             right_width = max(2, width - left_width - 1)
-            if state.rankings:
-                panels = [
-                    (_history_lines(history, left_width, current_user, frame, history_error, history_loader.running, state.memes), 0),
-                    (_ranking_lines(snapshot, right_width, current_user, frame, state.memes)
-                     if snapshot else [PanelLine("Loading Slurm jobs…")], 0),
-                ]
+            if state.view == "history":
+                panels = [(_history_lines(history, max(2, width), current_user, history_error, history_loader.running,
+                                          3 if state.history_page == "rest" else 0), 0)]
+            elif state.view == "live":
+                panels = [(_ranking_lines(snapshot, max(2, width), current_user)
+                           if snapshot else [PanelLine("Loading Slurm jobs…")], 0)]
             else:
                 panels = [
                     _panel_lines(
@@ -1446,7 +1667,8 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
         state.clamp(counts, page_height)
         _draw_screen(
             screen, state, panels, snapshot, current_user, args.interval,
-            updated, error, loader.running, title_attr, own_attr, remaining_attrs, podium_attrs,
+            updated, error, loader.running, title_attr, own_attr, remaining_attrs, podium_attrs, history, shine_attr,
+            history_error, history_loader.running,
         )
         action = _handle_key(state, screen.getch(), page_height, counts)
         if action == "quit":
@@ -1454,7 +1676,7 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
         if action == "refresh":
             loader.request()
             next_refresh = time.monotonic() + args.interval
-            if state.rankings:
+            if state.view == "history":
                 history_loader.request()
                 next_history_refresh = time.time() + HISTORY_INTERVAL
 

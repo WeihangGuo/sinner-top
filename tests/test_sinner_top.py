@@ -178,13 +178,15 @@ class SinnerTopChecks(unittest.TestCase):
         state = m.ViewState(gpu_types=["h200", "h100", "24gb", "47gb", "any"])
         state.offsets["h200", 0] = 4
         visited = []
-        for _ in range(len(state.gpu_types) + 1):
-            visited.append("rankings" if state.rankings else state.gpu_type)
+        for _ in range(len(state.gpu_types) + 2):
+            visited.append(state.view if state.rankings else state.gpu_type)
             m._handle_key(state, ord("g"), 10, [100, 100])
-        self.assertEqual(visited, state.gpu_types + ["rankings"])
+        self.assertEqual(visited, state.gpu_types + ["live", "history"])
         self.assertEqual(state.offset(0), 4)
         m._handle_key(state, ord("["), 10, [100, 100])
-        self.assertTrue(state.rankings)
+        self.assertEqual(state.view, "history")
+        m._handle_key(state, ord("["), 10, [100, 100])
+        self.assertEqual(state.view, "live")
         m._handle_key(state, ord("["), 10, [100, 100])
         self.assertEqual(state.gpu_type, "any")
         m._handle_key(state, ord("3"), 10, [100, 100])
@@ -202,7 +204,7 @@ class SinnerTopChecks(unittest.TestCase):
                 own_rows = [record for record in screen.writes if "alice (you)" in record[2]]
                 self.assertTrue(own_rows)
                 self.assertTrue(own_rows[0][3] & curses.A_REVERSE)
-                self.assertTrue(any(y == height - 1 and "[/]/g:view" in text for y, x, text, attr in screen.writes))
+                self.assertTrue(any(y == height - 1 and "g:view" in text for y, x, text, attr in screen.writes))
 
     def test_account_field_parsing_and_collection(self):
         legacy = "1|alice|train|node1|gres/gpu:h200:1|30:00|N/A|RUNNING"
@@ -250,44 +252,49 @@ class SinnerTopChecks(unittest.TestCase):
         self.assertTrue(any("🥇 bob" in line.text and not line.own for line in lines))
         self.assertTrue(any("🥉 carol" in line.text for line in lines))
         self.assertTrue(any("4. dave" in line.text for line in lines))
-        for width, height in ((120, 30), (80, 24), (40, 12), (30, 8)):
-            left_width = (width - 1) // 2
-            lines = m._ranking_lines(snap, width - left_width - 1, "alice")
-            history = m.HistorySnapshot(m._account_rankings(snap), NOW, "2025-08-04T21:40:00")
-            left = m._history_lines(history, left_width, "alice")
-            self.assertTrue(all(m._display_width(line.text) <= left_width for line in left))
-            self.assertTrue(all(m._display_width(line.text) <= width - left_width - 1 for line in lines))
-            screen = Screen(height, width)
-            state = m.ViewState(rankings=True)
-            m._draw_screen(screen, state, [(left, 0), (lines, 0)], snap, "alice", 5, NOW, "", False, curses.A_BOLD, curses.A_REVERSE)
-            self.assertTrue(any(x == left_width and text == "│" for y, x, text, attr in screen.writes))
-            self.assertTrue(any(y == 2 and x == 0 and "ALL-TIME" in text for y, x, text, attr in screen.writes))
-            self.assertTrue(any(y == 2 and x == left_width + 1 and "CURRENT" in text for y, x, text, attr in screen.writes))
-            self.assertTrue(any(y == height - 1 and "0:RANK" in text for y, x, text, attr in screen.writes))
+        history = m.HistorySnapshot(m._account_rankings(snap), NOW, "2025-08-04T21:40:00")
+        for width, height in ((120, 36), (80, 24), (40, 12), (30, 8)):
+            for view in ("live", "history"):
+                lines = m._ranking_lines(snap, width, "alice") if view == "live" else m._history_lines(history, width, "alice")
+                self.assertTrue(all(m._display_width(line.text) <= width for line in lines))
+                screen = Screen(height, width)
+                state = m.ViewState(view=view, animation_elapsed=3)
+                m._draw_screen(screen, state, [(lines, 0)], snap, "alice", 5, NOW, "", False,
+                               curses.A_BOLD, curses.A_REVERSE, history=history)
+                self.assertFalse(any(text == "│" for y, x, text, attr in screen.writes))
+                self.assertTrue(any(y == height - 1 and "0:LIVE" in text and "t:TOTAL" in text for y, x, text, attr in screen.writes))
+                if view == "live":
+                    self.assertFalse(any("OVERLORD" in text or "POWERING UP" in text for y, x, text, attr in screen.writes))
 
-    def test_ranking_navigation_keeps_separate_scroll_position(self):
+    def test_ranking_navigation_keeps_separate_scroll_positions(self):
         state = m.ViewState(pane=1)
         state.offsets["h200", 1] = 15
         m._handle_key(state, ord("0"), 10, [100, 100])
-        self.assertTrue(state.rankings)
-        m._handle_key(state, curses.KEY_DOWN, 10, [40, 40])
-        self.assertEqual(state.ranking_offsets, [5, 0])
-        m._handle_key(state, curses.KEY_RIGHT, 10, [40, 50])
-        m._handle_key(state, ord("j"), 10, [40, 50])
-        self.assertEqual(state.ranking_offsets, [5, 5])
-        m._handle_key(state, ord("h"), 10, [40, 50])
-        m._handle_key(state, curses.KEY_END, 10, [40, 40])
-        self.assertEqual(state.ranking_offsets, [30, 5])
-        m._handle_key(state, ord("0"), 10, [40, 40])
-        self.assertFalse(state.rankings)
+        self.assertEqual(state.view, "live")
+        m._handle_key(state, curses.KEY_DOWN, 10, [40])
+        self.assertEqual(state.offset(0), 5)
+        m._handle_key(state, ord("l"), 10, [40])
+        self.assertEqual((state.view, state.history_page), ("history", "podium"))
+        m._handle_key(state, ord("j"), 10, [40])
+        self.assertEqual(state.history_page, "rest")
+        self.assertEqual(state.offset(0), 0)
+        m._handle_key(state, ord("j"), 10, [40])
+        self.assertEqual(state.offset(0), 5)
+        m._handle_key(state, ord("h"), 10, [40])
+        self.assertEqual(state.view, "live")
+        self.assertEqual(state.offset(0), 5)
+        m._handle_key(state, ord("0"), 10, [40])
+        self.assertEqual(state.view, "jobs")
         self.assertEqual(state.focused_pane, 1)
         self.assertEqual(state.offset(1), 15)
-        m._handle_key(state, ord("a"), 10, [100, 100])
-        self.assertEqual(state.offset(0), 30)
-        m._handle_key(state, curses.KEY_HOME, 10, [40, 40])
-        self.assertEqual(state.ranking_offsets, [0, 5])
-        m._handle_key(state, ord("1"), 10, [40, 40])
-        self.assertFalse(state.rankings)
+        m._handle_key(state, ord("t"), 10, [40])
+        self.assertEqual(state.history_page, "podium")
+        m._handle_key(state, 10, 10, [40])
+        self.assertEqual(state.history_page, "all")
+        m._handle_key(state, ord("k"), 10, [40])
+        self.assertEqual(state.history_page, "podium")
+        m._handle_key(state, ord("1"), 10, [40])
+        self.assertEqual(state.view, "jobs")
         self.assertEqual(state.gpu_type, "h100")
 
     def test_history_counts_gpu_seconds_arrays_and_distinct_allocations(self):
@@ -364,20 +371,88 @@ class SinnerTopChecks(unittest.TestCase):
                     m.collect_history()
                 save.assert_not_called()
 
-    def test_podium_animation_changes_only_decorations_without_shifting_rows(self):
-        snap = snapshot([job(str(i), f"user{i}", account=f"lab{i}") for i in range(4)])
-        for width in (14, 24, 39, 59, 120):
-            frames = [m._ranking_lines(snap, width, "user0", frame) for frame in range(12)]
-            self.assertEqual(len({len(lines) for lines in frames}), 1)
-            self.assertNotEqual(frames[0], frames[1])
-            for lines in frames:
-                self.assertTrue(all(m._display_width(line.text) <= width for line in lines))
-                self.assertEqual([line.text for line in lines if line.heading], [line.text for line in frames[0] if line.heading])
-        state = m.ViewState(rankings=True)
-        m._handle_key(state, ord("e"), 20, [100, 100])
-        self.assertFalse(state.effects)
-        m._handle_key(state, ord("e"), 20, [100, 100])
+    def test_podium_layout_details_and_animation_frames(self):
+        accounts = [m.AccountUsage(f"lab{rank}", {"h200": 1000000, "h100": 7200},
+                                  {f"u{i}": {"h200": 3600 * (10 - i)} for i in range(6)}) for rank in range(3)]
+        for width, height in ((120, 36), (120, 30), (80, 24), (40, 12), (30, 8)):
+            layout = m._hero_layout(width, height)
+            self.assertEqual(layout[0][2], (width - 1) // 2)
+            self.assertEqual(layout[0][3], layout[1][3] + layout[2][3])
+            self.assertEqual(layout[2][1], layout[1][1] + layout[1][3])
+            for rank, (x, y, w, h) in enumerate(layout):
+                frames = [m._hero_card(accounts[rank], rank, w, h, t, "u1") for t in (0, .35, .75, 1.2, 2.5, 3.1)]
+                self.assertEqual(len({len(lines) for lines in frames}), 1)
+                for lines in frames:
+                    self.assertLessEqual(len(lines), h)
+                    self.assertTrue(all(m._display_width(line.text) <= w for line in lines))
+                if h >= 8:
+                    self.assertNotEqual(frames[0], frames[-1])
+                    self.assertNotEqual(frames[-2], frames[-1])
+                if width >= 80 and height >= 24:
+                    text = "\n".join(line.text for line in frames[-1])
+                    for user in accounts[rank].users:
+                        self.assertIn(user, text)
+                    self.assertTrue(any("u1" in line.text and line.own for line in frames[-1]))
+                    self.assertRegex(text, r"H200[:~]")
+
+    def test_entrance_replays_on_view_and_podium_returns_only(self):
+        state = m.ViewState()
+        m._handle_key(state, ord("t"), 20, [100, 100])
+        state.animate(10, False)
+        self.assertIsNone(state.animation_tick)
+        state.animate(20, True)
+        self.assertEqual(state.animation_elapsed, 0)
+        state.animate(23, True)
+        self.assertEqual(state.animation_elapsed, 3)
+        state.select_view("history")
+        state.animate(24, True)
+        self.assertEqual(state.animation_elapsed, 4)
+        m._handle_key(state, ord("e"), 20, [100])
+        state.animate(30, True)
+        self.assertEqual(state.animation_elapsed, 4)
+        m._handle_key(state, ord("e"), 20, [100])
+        state.animate(31, True)
+        self.assertEqual(state.animation_elapsed, 5)
+        m._handle_key(state, ord("j"), 20, [100])
+        state.animate(40, True)
+        self.assertEqual(state.animation_elapsed, 5)
+        m._handle_key(state, ord("b"), 20, [100])
+        self.assertEqual(state.animation_elapsed, 0)
+        self.assertIsNone(state.animation_tick)
+        state.animate(45, True)
+        m._handle_key(state, ord("h"), 20, [100])
+        m._handle_key(state, curses.KEY_RIGHT, 20, [100])
+        self.assertEqual((state.view, state.history_page, state.animation_elapsed), ("history", "podium", 0))
+
+    def test_history_next_page_starts_at_four_and_full_details_keep_every_user(self):
+        accounts = [m.AccountUsage(f"lab{i}", {"h200": 10000-i}, {f"member{i}": {"h200": 10000-i}}) for i in range(7)]
+        history = m.HistorySnapshot(accounts, NOW, "2025-08-01T00:00:00")
+        rest = m._history_lines(history, 80, "member4", start_rank=3)
+        headings = [line.text for line in rest if line.heading]
+        self.assertTrue(headings[0].startswith("4. lab3"))
+        self.assertNotIn("lab0", "\n".join(line.text for line in rest))
+        full = "\n".join(line.text for line in m._history_lines(history, 80, "member0"))
+        for i in range(7):
+            self.assertIn(f"member{i}", full)
+        empty_tail = m._history_lines(m.HistorySnapshot(accounts[:2], NOW, None), 80, "u", start_rank=3)
+        self.assertTrue(any("No accounts below" in line.text for line in empty_tail))
+
+    def test_live_page_never_draws_ascii_heroes_or_plays_animations(self):
+        snap = snapshot([job(account="lab")])
+        state = m.ViewState(view="live")
+        lines = m._ranking_lines(snap, 120, "alice")
+        history = m.HistorySnapshot(m._account_rankings(snap), NOW, None)
+        with patch.object(m, "_draw_heroes") as draw:
+            m._draw_screen(Screen(36, 120), state, [(lines, 0)], snap, "alice", 5, NOW, "", False,
+                           curses.A_BOLD, curses.A_REVERSE, history=history)
+            draw.assert_not_called()
+        state.animate(10, True)
+        self.assertIsNone(state.animation_tick)
+        m._handle_key(state, ord("e"), 20, [100])
+        m._handle_key(state, ord("m"), 20, [100])
         self.assertTrue(state.effects)
+        self.assertTrue(state.memes)
+        self.assertFalse(any("<<" in line.text or "OVERLORD" in line.text for line in lines))
 
     def test_empty_rankings_unknown_accounts_and_ties(self):
         self.assertIn("No running GPU allocations", m._ranking_lines(snapshot([]), 80, "alice")[0].text)

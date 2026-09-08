@@ -7,8 +7,8 @@ A terminal GPU monitor for Slurm clusters, with running and pending jobs side by
 - Includes individual job-array tasks and highlights your own jobs.
 - Discovers GPU resource types from Slurm, starting with H200 when available.
 - Shows pending start estimates and independent scroll positions for each pane and GPU type.
-- Ranks accounts and their users by historical GPU-hours and current GPU use in two panes.
-- Gives the top three medals, ASCII meme portraits, animated effects, and gold/silver/bronze colors.
+- Ranks accounts and their users on separate pages for historical GPU-hours and current GPU use.
+- Gives the all-time top three a dedicated podium page, clear ASCII memes, and replayable hero entrances.
 - Uses Python's standard library; no pip packages are needed.
 
 ## Install or update
@@ -84,11 +84,11 @@ All array tasks are available by scrolling in the interactive interface.
 
 | Key | Action |
 | --- | --- |
-| Left / `h` | Select Running, or historical usage in rankings |
-| Right / `l` | Select Pending, or current usage in rankings |
-| Up / `k` | Scroll up 5 lines |
-| Down / `j` | Scroll down 5 lines |
-| Tab | Switch panes |
+| Left / `h` | Select Running; from either ranking page, open Live |
+| Right / `l` | Select Pending; from either ranking page, open Total |
+| Up / `k` | Scroll up 5 lines; at the top of a historical list, return to the podium |
+| Down / `j` | On the podium, show rank #4 onward; in a list, scroll down 5 lines |
+| Tab | Switch job panes, or switch between Live and Total |
 | Page Up / Ctrl+U | Scroll one page up |
 | Page Down / Ctrl+D | Scroll one page down |
 | Home | Scroll to the top |
@@ -96,17 +96,20 @@ All array tasks are available by scrolling in the interactive interface.
 | `[` | Previous GPU type or rankings view |
 | `]` / `g` | Next GPU type or rankings view |
 | Number keys shown in the footer | Select a GPU type directly |
-| `0` / `a` | Open account rankings; press again to return to the previous GPU view |
-| `e` | Pause/resume podium animation in rankings |
-| `m` | Toggle large meme portraits / compact badges in rankings |
-| `r` | Refresh now, including history when rankings are open |
+| `0` / `a` | Open Live rankings; press again to return to the previous GPU view |
+| `t` | Open the all-time podium; press again to return to the previous GPU view |
+| Enter | From the podium, open a full list of all accounts and users |
+| `b` / Backspace | From a historical list, return to the podium and replay its entrance |
+| `e` | Pause/resume the all-time podium animation |
+| `m` | Toggle full memes / compact faces on the all-time podium |
+| `r` | Refresh now, including history when Total is open |
 | `q` / Ctrl+C | Quit |
 
 When present, `1` selects H100 and `2` selects H200. Other discovered GPU types
 get additional number shortcuts. All types remain reachable with `[` and `]`,
 including when there are more types than available number keys.
-The final footer entry, `0:RANK`, opens the account ranking view; it also follows
-the last GPU type when cycling with `[` / `]` / `g`.
+The footer shows `0:LIVE` and `t:TOTAL`. Both ranking pages follow the last GPU
+type when cycling with `[` / `]` / `g`.
 
 Your rows use a colored background, or reverse video when colors are disabled.
 The interface honors `NO_COLOR`; use `--color always` to enable colors explicitly.
@@ -119,40 +122,50 @@ the time text uses the terminal background for contrast.
 
 ## Account and user rankings
 
-Press `0` to open two leaderboards side by side:
+The rankings have two separate pages:
 
-- **Left — ALL-TIME GPU HOURS:** cumulative GPU allocation time, computed as
-  GPU count × elapsed hours. Four GPUs allocated for two hours add eight GPU-hours.
-- **Right — CURRENT GPU USE:** the number of GPUs currently allocated to running
-  and completing jobs, refreshed with the live job list.
+- **`0:LIVE` — current GPU use:** a full-width account and user list showing GPUs
+  allocated to running and completing jobs. It refreshes with the job list and
+  has no ASCII portraits, entrance animations, or particle effects.
+- **`t:TOTAL` — cumulative GPU-hours:** a dedicated podium for the three leading
+  accounts, followed by a separate list for the remaining ranks. Four GPUs
+  allocated for two hours add eight GPU-hours.
 
-Each pane ranks accounts highest first, then ranks users within each account.
-Ties are ordered alphabetically. Both include all GPU types, with type breakdowns
-for accounts and users using multiple types. Usage under different accounts is
-attributed to the account on each job. Every GPU counts equally; these totals
-measure allocated resources, not GPU kernel activity, CPU time, or relative GPU
-performance.
+On the podium, **first place occupies the left half of the terminal**. Second
+and third place split the right half vertically. Account totals, GPU-type usage,
+and member usage are expanded by default inside each card. The layout adjusts
+faces and detail columns to the available space; an unusually long user list
+shows a continuation hint, and Enter opens every account and user in a full-width
+list. Your account and user rows keep their highlight.
+Compact values use `kh` for thousands of GPU-hours; `~` marks the rounded
+per-type figures used in small cards. The full lists show the detailed totals.
 
-The first three accounts receive 🥇/🥈/🥉, gold/silver/bronze colors, and ASCII
-meme portraits surrounded by moving beams and sparks. The first three users in each
-account receive medals and animated accents. Effects update five times per
-second without moving the data rows; press `e` to pause/resume them. Your own
-user rows and accounts containing your usage keep their highlight. Press `m` to
-switch to compact badges when you want more account and user rows on screen.
-Portraits scale to the pane width, and their rows scroll with the account.
+The memes use original, clean line art: a sunglasses face ("Deal with it"), a
+GPU goblin ("More! More!"), and a coffee-holding dog ("This is fine"). Each enters
+from a different direction, with staggered arrivals and a brief landing burst.
+After the entrance, the faces stay still while stars and light beams move around
+them. Every return to the podium replays the entrance; routine data refreshes
+and resizing do not. The animation waits for the first history report and never
+blocks keyboard input. `e` pauses/resumes it; `m` switches to compact faces.
+No image downloads, fonts, or rendering libraries are required by the script.
 
-The first two portraits are terminal adaptations of the supplied
-[character portrait](https://miro.medium.com/v2/resize:fit:482/format:webp/1*WlwVGfL5qrp7m6I2nfM8AA.png)
-and [The Shining typography reference](https://www.artpie.co.uk/wp-content/uploads/2013/06/ascii-art-shining.jpg).
-The third is an original ASCII grin. All portraits are embedded as text in the
-script; no images, rendering libraries, or image downloads are needed at runtime.
+Press **Down / `j`** on the podium to open the next page, starting at **rank #4**.
+The remaining accounts and their users are expanded there by default. In lists,
+Up/Down or `k`/`j` scroll five lines, and Page Up/Down and Home/End work normally.
+Press `b` to return to the podium; Up at the top of a historical list also returns.
+Enter on the podium opens the full list starting with rank #1, including any
+members that do not fit inside the podium cards. Live and historical lists have
+separate scroll positions. Returning to a GPU view restores its pane and position.
 
-Use Left/Right or `h`/`l` to select a pane, and Up/Down or `k`/`j` to scroll five
-lines. Page Up/Down and Home/End also work. Each pane retains its scroll position,
-and returning to a GPU view restores that view's pane and position.
+Both rankings combine all GPU types. Accounts and users within each account
+are sorted highest first, with alphabetical tie-breaking. Every GPU counts
+equally; usage is attributed to the account on each job. These totals measure
+allocated resources, not GPU kernel activity, CPU time, or relative performance.
+Account/user lists retain 🥇/🥈/🥉 medals, and the podium uses gold/silver/bronze
+colors. Names, totals, and user details remain visible during the entrance.
 
 History includes **all accounting records still retained and visible to you**,
-queried from 1970 onward with `sacct`. The left pane shows the earliest GPU
+queried from 1970 onward with `sacct`. The Total page shows the earliest GPU
 allocation found and the report's timestamp. Deleted or inaccessible accounting
 records cannot be recovered. Individual array tasks and distinct allocation
 records with reused job IDs are included; job steps such as `.batch` and `.extern`
@@ -160,13 +173,13 @@ are excluded to avoid counting their parent's GPUs again. Pending requests add
 no usage. Running allocations contribute their elapsed time at the history
 query, so historical totals advance on the history refresh interval.
 
-History loads in the background when the rankings are first opened and refreshes
+History loads in the background when Total is first opened and refreshes
 every 15 minutes while that view is open. Navigation and live jobs remain responsive
 during the query. A private aggregate cache under
 `${XDG_CACHE_HOME:-~/.cache}/sinner-top/` makes subsequent launches faster; caches
-are separated by login host, user and Slurm configuration. Press `r` in rankings
-to refresh immediately. If accounting is unavailable, the left pane reports the
-error and retains any previous successful report; current usage remains available.
+are separated by login host, user and Slurm configuration. Press `r` in Total
+to refresh immediately. If accounting is unavailable, the page reports the
+error and retains any previous successful report; Live remains available.
 
 ## Reading the display
 
