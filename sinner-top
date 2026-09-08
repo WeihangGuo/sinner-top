@@ -30,6 +30,7 @@ import curses
 import getpass
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -130,6 +131,11 @@ ACCOUNT_LETTERS = {
     ".": "00000/00000/00000/00000/00100", "?": "01110/10001/00110/00000/00100",
 }
 HERO_ENTRANCE_SECONDS = 1.8
+HERO_COLORS = (
+    (58, 94, 136, 178, 220, 228, 230),   # amber shadows through pale gold
+    (236, 240, 244, 248, 250, 253, 255),  # graphite through polished silver
+    (52, 94, 130, 172, 208, 215, 223),    # deep copper through peach highlights
+)
 HISTORY_INTERVAL = 15 * 60
 HISTORY_TIMEOUT = 120
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
@@ -923,6 +929,7 @@ class PanelLine:
     remaining_seconds: float | None = None
     podium_rank: int | None = None
     flash: bool = False
+    tints: tuple[tuple[int, int, int], ...] = ()  # character start, length, shade
 
 
 @dataclass
@@ -1163,6 +1170,58 @@ def _account_banner(name: str, width: int, max_height: int) -> list[str]:
     return rows
 
 
+def _tint_runs(shades: Sequence[int], offset: int = 0) -> tuple[tuple[int, int, int], ...]:
+    runs = []
+    start = 0
+    for end in range(1, len(shades) + 1):
+        if end == len(shades) or shades[end] != shades[start]:
+            runs.append((offset + start, end - start, shades[start]))
+            start = end
+    return tuple(runs)
+
+
+def _sculpted_art(rows: Sequence[str], elapsed: float, *, lettering: bool = False):
+    """Opaque art with an offset shadow, bevel lighting and a travelling shine."""
+    width = max(map(len, rows), default=0)
+    source = [row.ljust(width) for row in rows]
+    pixels = [list(row) for row in source]
+    shades = [[0] * width for _ in source]
+    sweep = (elapsed * (8 if lettering else 6)) % (width + 14) - 7
+    for y, row in enumerate(source):
+        for x, char in enumerate(row):
+            if char == " ":
+                continue
+            # The shadow stays behind the original contours and letter strokes.
+            for dx, dy, shadow in ((1, 1, ":"), (2, 1, ".")):
+                sx, sy = x + dx, y + dy
+                if sy < len(source) and sx < width and source[sy][sx] == " ":
+                    pixels[sy][sx] = shadow
+                    shades[sy][sx] = 1 if dx == 1 else 0
+    for y, row in enumerate(source):
+        for x, char in enumerate(row):
+            if char == " ":
+                continue
+            light = 5 if y == 0 or source[y - 1][x] == " " else 3
+            if x == 0 or source[y][x - 1] == " ":
+                light = max(light, 4)
+            if not lettering and y > len(source) * .6:
+                light = max(2, light - 1)
+            distance = abs(x + y * .6 - sweep)
+            if distance < 1.2:
+                light = 6
+            elif distance < 2.7:
+                light = 5
+            shades[y][x] = light
+    return ["".join(row) for row in pixels], shades
+
+
+def _border_tints(text: str, phase: int, flash: bool = False):
+    return _tint_runs([
+        6 if flash or (x - phase) % 17 < 2 else 4 if (x - phase) % 17 < 6 else 2
+        for x in range(len(text))
+    ])
+
+
 def _hero_card(
     account: AccountUsage, rank: int, width: int, height: int,
     elapsed: float, current_user: str, memes: bool = True,
@@ -1225,27 +1284,59 @@ def _hero_card(
         face_width *= 2
     local = max(0.0, elapsed - rank * 0.22)
     impact = 0.65 <= local < 0.95
-    phase = int(elapsed * 7)
+    phase = int(elapsed * 10)
     canvas = [[" "] * inner for _ in range(body_height)]
+    canvas_shades = [[0] * inner for _ in range(body_height)]
 
-    def put(y: int, x: int, value: str) -> None:
+    def put(y: int, x: int, value: str, shade: int = 2) -> None:
         if 0 <= y < body_height:
             for dx, char in enumerate(value):
                 if 0 <= x + dx < inner:
                     canvas[y][x + dx] = char
+                    canvas_shades[y][x + dx] = shade
 
-    for n in range(max(4, inner // 5)):
-        y = (n * 3 + phase // 2 + rank) % body_height
-        x = (n * 11 + phase + rank * 5) % inner
-        put(y, x, (".", "+", "*", ".")[(phase + n) % 4])
+    # Parallax motes: brighter particles travel faster and leave dim tails.
+    for n in range(max(10, art_width * body_height // 35)):
+        speed = 1 + n % 3
+        y = (n * 7 - phase // (4 - speed)) % body_height
+        x = (n * 17 + phase * speed // 3 + rank * 5) % art_width
+        put(y, x - 2, "..", 0)
+        put(y, x, (".", "+", "*", "o")[(phase // 4 + n) % 4], 3 + n % 4)
+    # Light fans and comets cross the space behind the stationary face.
+    margin = max(2, (art_width - face_width) // 2)
     for y in range(body_height):
-        reach = (phase + y) % max(1, (inner - face_width) // 2)
-        put(y, reach, "/" if y < body_height // 2 else "\\")
-        put(y, inner - 1 - reach, "\\" if y < body_height // 2 else "/")
+        for ray in range(3):
+            reach = int(y * (.35 + ray * .2) + elapsed * (1.2 + ray)) % (margin + 3)
+            put(y, reach, "/" if y < body_height // 2 else "\\", 1 + ray)
+            put(y, art_width - 1 - reach, "\\" if y < body_height // 2 else "/", 1 + ray)
+    for n in range(2):
+        x = (phase * 2 + n * 23) % (art_width + 8) - 4
+        y = (phase // 3 + n * 5) % body_height
+        put(y, x - 3, "...", 1)
+        put(y, x - 1, "-", 3)
+        put(y, x, "*", 6)
+    # Four-point flares and a repeating halo, with a larger landing shockwave.
+    for n in range(2):
+        x = (phase // 3 + n * 19 + rank * 3) % art_width
+        y = (n * 5 + phase // 7) % body_height
+        if (phase // 3 + n) % 4 < 2:
+            put(y - 1, x, "|", 3)
+            put(y, x - 1, "-+-", 5)
+            put(y + 1, x, "|", 3)
+    burst = local - .65 if impact else (elapsed + rank * .7) % 4.5
+    if 0 <= burst < .9:
+        center_x = art_width // 2 if impact else max(2, margin // 2)
+        center_y = body_height // 2 if impact else body_height // 3
+        radius = burst * (art_width * 1.6 if impact else 8)
+        for n in range(16):
+            angle = n * math.pi / 8
+            x = round(center_x + math.cos(angle) * radius)
+            y = round(center_y + math.sin(angle) * radius * .5)
+            put(y, x, "*" if n % 2 else "+", 6 if impact else 4 + n % 3)
     if impact:
         for y in range(body_height):
-            put(y, 0, ">>>" if y % 2 else "***")
-            put(y, inner - 3, "<<<" if y % 2 else "***")
+            put(y, 0, ">>>" if y % 2 else "***", 6)
+            put(y, art_width - 3, "<<<" if y % 2 else "***", 6)
     progress = min(1.0, local / 0.65)
     x = (art_width - face_width) // 2
     y = (body_height - len(face)) // 2
@@ -1255,8 +1346,13 @@ def _hero_card(
         y = round(-len(face) + (y + len(face)) * progress)
     else:
         x = round(inner + (x - inner) * progress)
+    face, face_shades = _sculpted_art(face, elapsed)
     for dy, line in enumerate(face):
         put(y + dy, x, line)
+        if 0 <= y + dy < body_height:
+            for dx, shade in enumerate(face_shades[dy]):
+                if 0 <= x + dx < inner:
+                    canvas_shades[y + dy][x + dx] = shade
     title = f" #{rank + 1} {HERO_TITLES[rank]} "
     if local < 0.65:
         title = f" >>> #{rank + 1} INCOMING <<< "
@@ -1270,7 +1366,7 @@ def _hero_card(
         lines = [PanelLine("+" + _center_label(header, inner) + "+", own, True, podium_rank=rank, flash=impact)]
     else:
         lines = [
-            PanelLine(border, podium_rank=rank, flash=impact),
+            PanelLine(border, podium_rank=rank, flash=impact, tints=_border_tints(border, phase, impact)),
             PanelLine("|" + _center_label(account.account, inner) + "|", own, True, podium_rank=rank),
             PanelLine("|" + _center_label(total, inner) + "|", podium_rank=rank),
         ]
@@ -1298,11 +1394,17 @@ def _hero_card(
                 detail = f"+{len(users) - y} more (Enter)"
                 line_own = False
             row[start:] = list(_clip_text(detail, detail_width).ljust(detail_width))
-        lines.append(PanelLine("|" + "".join(row) + "|", line_own, podium_rank=rank))
+        tinted_width = art_width if side_details else inner
+        tints = _tint_runs(canvas_shades[y][:tinted_width], 1)
+        tints += ((0, 1, 5 if (phase + y) % 9 < 2 else 2),)
+        lines.append(PanelLine("|" + "".join(row) + "|", line_own, podium_rank=rank, tints=tints))
     caption = HERO_CAPTIONS[rank] if local >= 0.95 else "POWERING UP..."
     if banner:
-        lines.extend(PanelLine("|" + _center_label(row, inner) + "|", own, True, podium_rank=rank)
-                     for row in banner)
+        letter_rows = [_center_label(row, inner) for row in banner]
+        letter_rows, letter_shades = _sculpted_art(letter_rows, elapsed, lettering=True)
+        lines.extend(PanelLine("|" + row + "|", heading=True, podium_rank=rank,
+                              tints=_tint_runs(shades, 1))
+                     for row, shades in zip(letter_rows, letter_shades))
     elif not short_header:
         lines.append(PanelLine("|" + _center_label(caption, inner) + "|", podium_rank=rank, flash=impact))
     for y in range(user_rows):
@@ -1321,12 +1423,13 @@ def _hero_card(
         lines.append(PanelLine("|" + _center_label("".join(cells), inner) + "|", line_own, podium_rank=rank))
     beam = ("==->>==" if phase % 2 else "->>====") * (width // 7 + 1)
     bottom = _center_label(caption, inner) if short_header else beam[:inner]
-    lines.append(PanelLine("+" + bottom + "+", podium_rank=rank, flash=impact))
+    text = "+" + bottom + "+"
+    lines.append(PanelLine(text, podium_rank=rank, flash=impact, tints=_border_tints(text, -phase, impact)))
 
     return lines
 
 
-def _draw_heroes(screen, state, history, current_user, podium_attrs, own_attr, shine_attr):
+def _draw_heroes(screen, state, history, current_user, podium_attrs, own_attr, shine_attr, hero_palettes=()):
     if history is None or not history.accounts:
         return
     height, width = screen.getmaxyx()
@@ -1343,6 +1446,12 @@ def _draw_heroes(screen, state, history, current_user, podium_attrs, own_attr, s
             if line.own:
                 attr = own_attr | curses.A_BOLD
             _write(screen, y, start, line.text, card_width, attr)
+            palette = hero_palettes[rank] if hero_palettes else (
+                curses.A_DIM, curses.A_DIM, 0, 0, curses.A_BOLD, curses.A_BOLD, curses.A_BOLD,
+            )
+            for offset, length, shade in line.tints:
+                text = line.text[offset:offset + length]
+                _write(screen, y, start + offset, text, length, palette[shade])
 
 
 def _gpu_hours(seconds: int) -> str:
@@ -1515,6 +1624,7 @@ def _draw_screen(
     shine_attr: int = curses.A_BOLD,
     history_error: str = "",
     history_loading: bool = False,
+    hero_palettes: Sequence[Sequence[int]] = (),
 ) -> None:
     height, width = screen.getmaxyx()
     screen.erase()
@@ -1549,7 +1659,7 @@ def _draw_screen(
     starts = (0, left_width + 1)
     podium = _podium_visible(state) and history is not None and bool(history.accounts)
     if podium:
-        _draw_heroes(screen, state, history, current_user, podium_attrs, own_attr, shine_attr)
+        _draw_heroes(screen, state, history, current_user, podium_attrs, own_attr, shine_attr, hero_palettes)
     label_y = 2
     page_height = height - 6
     if state.rankings:
@@ -1630,6 +1740,7 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
     own_attr = curses.A_REVERSE
     remaining_attrs: dict[str, int] = {}
     podium_attrs: list[int] = []
+    hero_palettes: list[tuple[int, ...]] = []
     shine_attr = curses.A_BOLD | curses.A_REVERSE
     if use_color and curses.has_colors():
         curses.start_color()
@@ -1659,6 +1770,23 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
             podium_attrs.append(curses.A_BOLD | curses.color_pair(pair))
         curses.init_pair(9, curses.COLOR_WHITE, background)
         shine_attr = curses.A_BOLD | curses.color_pair(9)
+        for rank, colors in enumerate(HERO_COLORS):
+            shades = []
+            for shade, foreground in enumerate(colors):
+                if curses.COLORS >= 256 and curses.COLOR_PAIRS >= 31:
+                    pair = 10 + rank * 7 + shade
+                    curses.init_pair(pair, foreground, background)
+                    attr = curses.color_pair(pair) | (curses.A_BOLD if shade >= 4 else 0)
+                else:
+                    attr = podium_attrs[rank] & ~curses.A_BOLD
+                    if shade <= 1:
+                        attr |= curses.A_DIM
+                    elif shade >= 4:
+                        attr |= curses.A_BOLD
+                    if shade == 6:
+                        attr = shine_attr
+                shades.append(attr)
+            hero_palettes.append(tuple(shades))
     state = ViewState(gpu_type=args.gpu)
     loader = SnapshotLoader()
     history_loader = SnapshotLoader(collect_history)
@@ -1722,7 +1850,7 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
         _draw_screen(
             screen, state, panels, snapshot, current_user, args.interval,
             updated, error, loader.running, title_attr, own_attr, remaining_attrs, podium_attrs, history, shine_attr,
-            history_error, history_loader.running,
+            history_error, history_loader.running, hero_palettes,
         )
         action = _handle_key(state, screen.getch(), page_height, counts)
         if action == "quit":

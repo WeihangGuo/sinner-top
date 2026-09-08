@@ -146,8 +146,12 @@ place, a sunglasses face ("Deal with it") for second, and a coffee-holding dog
 letters below its meme. Longer names use narrower letters or wrap; very small
 panes fall back to a compact name label. Each meme enters
 from a different direction, with staggered arrivals and a brief landing burst.
-After the entrance, the faces stay still while stars and light beams move around
-them. Every return to the podium replays the entrance; routine data refreshes
+Faces and the account lettering use seven shades within each gold, silver, or
+copper palette, with offset shadows, lit edges, and a travelling highlight.
+After the entrance, the faces stay still while layered light fans, comet trails,
+four-point star flares, and expanding halos move around them. Frame edges carry
+moving highlights too. Terminals with fewer colors use dim and bold shades as
+a fallback. Every return to the podium replays the entrance; routine data refreshes
 and resizing do not. The animation waits for the first history report and never
 blocks keyboard input. `e` pauses/resumes it; `m` switches to compact faces.
 No image downloads, fonts, or rendering libraries are required by the script.
