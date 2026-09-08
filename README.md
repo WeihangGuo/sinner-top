@@ -7,7 +7,8 @@ A terminal GPU monitor for Slurm clusters, with running and pending jobs side by
 - Includes individual job-array tasks and highlights your own jobs.
 - Discovers GPU resource types from Slurm, starting with H200 when available.
 - Shows pending start estimates and independent scroll positions for each pane and GPU type.
-- Ranks accounts and their users by current GPU use, with medals for the top three.
+- Ranks accounts and their users by historical GPU-hours and current GPU use in two panes.
+- Gives the top three medals, ASCII meme portraits, animated effects, and gold/silver/bronze colors.
 - Uses Python's standard library; no pip packages are needed.
 
 ## Install or update
@@ -19,8 +20,20 @@ curl -LsSf https://raw.githubusercontent.com/WeihangGuo/sinner-top/main/install.
 ```
 
 The installer writes to `~/.local/bin/sinner-top` and does not require `sudo`.
-Run the same command again to update. A failed download or syntax check leaves
-the previous installation intact.
+Once installed, update directly with:
+
+```sh
+sinner-top update
+```
+
+This downloads the latest script from this repository's `main` branch, checks
+its Python syntax, and atomically replaces the executable you invoked. It works
+with custom installation paths and follows symlinks to the actual script. No
+Slurm queries are needed. An identical download reports that you are already
+up to date; a failed download or validation leaves the previous version intact.
+`SINNER_TOP_VERSION` can select a tag or commit, as with the installer.
+
+For older versions without the `update` command, run the curl installer again.
 
 If `~/.local/bin` is not in your `PATH`, add this line to `~/.bashrc` or `~/.zshrc`
 and open a new terminal:
@@ -43,6 +56,7 @@ To install the script from a particular Git commit or tag, set
 
 - Python 3.9 or newer with the `curses` module.
 - A Slurm environment with `squeue` and `scontrol` in `PATH`.
+- `sacct` and accessible Slurm accounting records for historical GPU-hours.
 - A terminal for the interactive interface. Piped output uses a printable snapshot.
 - `curl` for the installer.
 
@@ -70,8 +84,8 @@ All array tasks are available by scrolling in the interactive interface.
 
 | Key | Action |
 | --- | --- |
-| Left / `h` | Select Running |
-| Right / `l` | Select Pending |
+| Left / `h` | Select Running, or historical usage in rankings |
+| Right / `l` | Select Pending, or current usage in rankings |
 | Up / `k` | Scroll up 5 lines |
 | Down / `j` | Scroll down 5 lines |
 | Tab | Switch panes |
@@ -83,7 +97,9 @@ All array tasks are available by scrolling in the interactive interface.
 | `]` / `g` | Next GPU type or rankings view |
 | Number keys shown in the footer | Select a GPU type directly |
 | `0` / `a` | Open account rankings; press again to return to the previous GPU view |
-| `r` | Refresh now |
+| `e` | Pause/resume podium animation in rankings |
+| `m` | Toggle large meme portraits / compact badges in rankings |
+| `r` | Refresh now, including history when rankings are open |
 | `q` / Ctrl+C | Quit |
 
 When present, `1` selects H100 and `2` selects H200. Other discovered GPU types
@@ -103,22 +119,54 @@ the time text uses the terminal background for contrast.
 
 ## Account and user rankings
 
-Press `0` to see a full-width leaderboard of Slurm accounts. Each account lists
-its users underneath it. Both accounts and users within each account are sorted
-by the number of GPUs currently allocated, highest first. The first three in
-each ranking receive 🥇, 🥈, and 🥉; ties are ordered alphabetically.
+Press `0` to open two leaderboards side by side:
 
-The ranking combines all GPU types and shows their counts separately beside
-each total. It counts each allocated GPU equally, including individual array
-tasks, and excludes pending requests. It measures current GPU occupancy, not
-historical GPU-hours, CPU use, or relative GPU performance. Account membership
-comes from each running job's Slurm account, so a user's usage is attributed
-separately when they run jobs under multiple accounts.
+- **Left — ALL-TIME GPU HOURS:** cumulative GPU allocation time, computed as
+  GPU count × elapsed hours. Four GPUs allocated for two hours add eight GPU-hours.
+- **Right — CURRENT GPU USE:** the number of GPUs currently allocated to running
+  and completing jobs, refreshed with the live job list.
 
-Your user rows and accounts with your running jobs are highlighted. Scroll with
-Up/Down or `k`/`j` (five lines), Page Up/Down, or Home/End. The ranking has its
-own scroll position; returning to a GPU view restores that view's position.
-No extra Slurm queries are needed for the ranking.
+Each pane ranks accounts highest first, then ranks users within each account.
+Ties are ordered alphabetically. Both include all GPU types, with type breakdowns
+for accounts and users using multiple types. Usage under different accounts is
+attributed to the account on each job. Every GPU counts equally; these totals
+measure allocated resources, not GPU kernel activity, CPU time, or relative GPU
+performance.
+
+The first three accounts receive 🥇/🥈/🥉, gold/silver/bronze colors, and ASCII
+meme portraits surrounded by moving beams and sparks. The first three users in each
+account receive medals and animated accents. Effects update five times per
+second without moving the data rows; press `e` to pause/resume them. Your own
+user rows and accounts containing your usage keep their highlight. Press `m` to
+switch to compact badges when you want more account and user rows on screen.
+Portraits scale to the pane width, and their rows scroll with the account.
+
+The first two portraits are terminal adaptations of the supplied
+[character portrait](https://miro.medium.com/v2/resize:fit:482/format:webp/1*WlwVGfL5qrp7m6I2nfM8AA.png)
+and [The Shining typography reference](https://www.artpie.co.uk/wp-content/uploads/2013/06/ascii-art-shining.jpg).
+The third is an original ASCII grin. All portraits are embedded as text in the
+script; no images, rendering libraries, or image downloads are needed at runtime.
+
+Use Left/Right or `h`/`l` to select a pane, and Up/Down or `k`/`j` to scroll five
+lines. Page Up/Down and Home/End also work. Each pane retains its scroll position,
+and returning to a GPU view restores that view's pane and position.
+
+History includes **all accounting records still retained and visible to you**,
+queried from 1970 onward with `sacct`. The left pane shows the earliest GPU
+allocation found and the report's timestamp. Deleted or inaccessible accounting
+records cannot be recovered. Individual array tasks and distinct allocation
+records with reused job IDs are included; job steps such as `.batch` and `.extern`
+are excluded to avoid counting their parent's GPUs again. Pending requests add
+no usage. Running allocations contribute their elapsed time at the history
+query, so historical totals advance on the history refresh interval.
+
+History loads in the background when the rankings are first opened and refreshes
+every 15 minutes while that view is open. Navigation and live jobs remain responsive
+during the query. A private aggregate cache under
+`${XDG_CACHE_HOME:-~/.cache}/sinner-top/` makes subsequent launches faster; caches
+are separated by login host, user and Slurm configuration. Press `r` in rankings
+to refresh immediately. If accounting is unavailable, the left pane reports the
+error and retains any previous successful report; current usage remains available.
 
 ## Reading the display
 

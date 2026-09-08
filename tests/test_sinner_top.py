@@ -3,6 +3,7 @@ import curses
 import importlib.machinery
 import importlib.util
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from datetime import datetime
@@ -250,12 +251,18 @@ class SinnerTopChecks(unittest.TestCase):
         self.assertTrue(any("🥉 carol" in line.text for line in lines))
         self.assertTrue(any("4. dave" in line.text for line in lines))
         for width, height in ((120, 30), (80, 24), (40, 12), (30, 8)):
-            lines = m._ranking_lines(snap, width, "alice")
-            self.assertTrue(all(m._display_width(line.text) <= width for line in lines))
+            left_width = (width - 1) // 2
+            lines = m._ranking_lines(snap, width - left_width - 1, "alice")
+            history = m.HistorySnapshot(m._account_rankings(snap), NOW, "2025-08-04T21:40:00")
+            left = m._history_lines(history, left_width, "alice")
+            self.assertTrue(all(m._display_width(line.text) <= left_width for line in left))
+            self.assertTrue(all(m._display_width(line.text) <= width - left_width - 1 for line in lines))
             screen = Screen(height, width)
             state = m.ViewState(rankings=True)
-            m._draw_screen(screen, state, [], snap, "alice", 5, NOW, "", False, curses.A_BOLD, curses.A_REVERSE, ranking_lines=lines)
-            self.assertFalse(any(text == "│" for y, x, text, attr in screen.writes))
+            m._draw_screen(screen, state, [(left, 0), (lines, 0)], snap, "alice", 5, NOW, "", False, curses.A_BOLD, curses.A_REVERSE)
+            self.assertTrue(any(x == left_width and text == "│" for y, x, text, attr in screen.writes))
+            self.assertTrue(any(y == 2 and x == 0 and "ALL-TIME" in text for y, x, text, attr in screen.writes))
+            self.assertTrue(any(y == 2 and x == left_width + 1 and "CURRENT" in text for y, x, text, attr in screen.writes))
             self.assertTrue(any(y == height - 1 and "0:RANK" in text for y, x, text, attr in screen.writes))
 
     def test_ranking_navigation_keeps_separate_scroll_position(self):
@@ -264,19 +271,113 @@ class SinnerTopChecks(unittest.TestCase):
         m._handle_key(state, ord("0"), 10, [100, 100])
         self.assertTrue(state.rankings)
         m._handle_key(state, curses.KEY_DOWN, 10, [40, 40])
-        self.assertEqual(state.ranking_offset, 5)
+        self.assertEqual(state.ranking_offsets, [5, 0])
+        m._handle_key(state, curses.KEY_RIGHT, 10, [40, 50])
+        m._handle_key(state, ord("j"), 10, [40, 50])
+        self.assertEqual(state.ranking_offsets, [5, 5])
+        m._handle_key(state, ord("h"), 10, [40, 50])
         m._handle_key(state, curses.KEY_END, 10, [40, 40])
-        self.assertEqual(state.ranking_offset, 30)
+        self.assertEqual(state.ranking_offsets, [30, 5])
         m._handle_key(state, ord("0"), 10, [40, 40])
         self.assertFalse(state.rankings)
+        self.assertEqual(state.focused_pane, 1)
         self.assertEqual(state.offset(1), 15)
         m._handle_key(state, ord("a"), 10, [100, 100])
         self.assertEqual(state.offset(0), 30)
         m._handle_key(state, curses.KEY_HOME, 10, [40, 40])
-        self.assertEqual(state.ranking_offset, 0)
+        self.assertEqual(state.ranking_offsets, [0, 5])
         m._handle_key(state, ord("1"), 10, [40, 40])
         self.assertFalse(state.rankings)
         self.assertEqual(state.gpu_type, "h100")
+
+    def test_history_counts_gpu_seconds_arrays_and_distinct_allocations(self):
+        rows = [
+            "42_1|alpha|alice|3600|gres/gpu=4,gres/gpu:h200=2,gres/gpu:h100=1|2025-08-04T12:00:00",
+            "42_1.batch|alpha|alice|3600|gres/gpu=4|2025-08-04T12:00:00",
+            "42_1.0|alpha|alice|3600|gres/gpu=4|2025-08-04T12:00:00",
+            "42_2|alpha|alice|1800|gres/gpu=2,gres/gpu:h200=2|2025-08-05T12:00:00",
+            "43|beta|alice|7200|gres/gpu=2|2025-08-06T12:00:00",
+            # An older allocation with a reused ID must also count.
+            "43|beta|bob|3600|gres/gpu=1|2025-08-01T12:00:00",
+            "44|pending|dave|0||Unknown",
+            "45|cpu|bob|999999|cpu=100|2024-01-01T12:00:00",
+            "46|zero|bob|0|gres/gpu=8|2025-01-01T12:00:00",
+        ]
+        history = m.parse_sacct_history(iter(rows), NOW)
+        self.assertEqual([row.account for row in history.accounts], ["alpha", "beta"])
+        self.assertEqual(history.accounts[0].usage, {"h200": 10800, "h100": 3600, "any": 3600})
+        self.assertEqual(history.accounts[1].users, {"alice": {"any": 14400}, "bob": {"any": 3600}})
+        self.assertEqual(history.earliest, "2025-08-01T12:00:00")
+        self.assertEqual(history.updated, NOW)
+        lines = m._history_lines(history, 80, "alice")
+        self.assertTrue(any("5.0 GPU-h" in line.text and line.heading for line in lines))
+        self.assertTrue(any("Retained records since 2025-08-01" in line.text for line in lines))
+        self.assertTrue(any("alice (you)" in line.text and line.own for line in lines))
+
+    def test_history_empty_missing_and_invalid_data(self):
+        empty = m.parse_sacct_history([], NOW)
+        self.assertEqual(empty.accounts, [])
+        self.assertIsNone(empty.earliest)
+        self.assertTrue(any("No GPU usage" in line.text for line in m._history_lines(empty, 80, "alice")))
+        with self.assertRaises(ValueError):
+            m.parse_sacct_history(["unexpected|format"], NOW)
+        with self.assertRaises(ValueError):
+            m.parse_sacct_history(["1|lab|alice|-1|gres/gpu=1|Unknown"], NOW)
+        history = m.parse_sacct_history(["1|N/A||30|gres/gpu=1|Unknown"], NOW)
+        self.assertEqual(history.accounts[0].account, "unknown")
+        self.assertEqual(history.accounts[0].users, {"unknown": {"any": 30}})
+        lines = m._history_lines(history, 80, "alice", error="offline")
+        self.assertTrue(any("last successful" in line.text for line in lines))
+        self.assertTrue(any("History unavailable: offline" in line.text for line in lines))
+        self.assertTrue(any(line.heading for line in lines))
+
+    def test_history_cache_roundtrip_permissions_and_corruption(self):
+        history = m.parse_sacct_history(["1|lab|alice|3600|gres/gpu=2|2025-01-01T00:00:00"], NOW)
+        with tempfile.TemporaryDirectory() as directory, patch.object(m, "_history_cache_path", return_value=Path(directory) / "history.json"):
+            self.assertIsNone(m._read_history_cache())
+            m._save_history_cache(history)
+            self.assertEqual(m._read_history_cache(), history)
+            path = m._history_cache_path()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            for text in ('{"version":1}', 'invalid', '{"version":1,"updated":1,"earliest":null,"accounts":{"a":{"u":{"h200":-1}}}}'):
+                path.write_text(text)
+                self.assertIsNone(m._read_history_cache())
+
+    def test_history_collection_uses_all_retained_allocations_and_background_loader(self):
+        def report(command, **kwargs):
+            self.assertIn("--starttime=1970-01-01", command)
+            self.assertTrue(all(option in command for option in ("--local", "--allusers", "--allocations", "--array", "--duplicates")))
+            self.assertEqual(kwargs["timeout"], 120)
+            kwargs["stdout"].write("1|lab|alice|1800|gres/gpu=4|2025-01-01T00:00:00\n")
+        history_loader = m.SnapshotLoader(m.collect_history)
+        with patch.object(m.subprocess, "run", side_effect=report), patch.object(m, "_save_history_cache") as save:
+            history_loader.request()
+            history, error = history_loader.results.get(timeout=2)
+        self.assertEqual(error, "")
+        self.assertEqual(history.accounts[0].usage, {"any": 7200})
+        save.assert_called_once_with(history)
+
+    def test_history_failure_leaves_cache_untouched(self):
+        for error in (FileNotFoundError(), m.subprocess.TimeoutExpired("sacct", 120), m.subprocess.CalledProcessError(1, "sacct", stderr="denied")):
+            with patch.object(m.subprocess, "run", side_effect=error), patch.object(m, "_save_history_cache") as save:
+                with self.assertRaises(m.SlurmCommandError):
+                    m.collect_history()
+                save.assert_not_called()
+
+    def test_podium_animation_changes_only_decorations_without_shifting_rows(self):
+        snap = snapshot([job(str(i), f"user{i}", account=f"lab{i}") for i in range(4)])
+        for width in (14, 24, 39, 59, 120):
+            frames = [m._ranking_lines(snap, width, "user0", frame) for frame in range(12)]
+            self.assertEqual(len({len(lines) for lines in frames}), 1)
+            self.assertNotEqual(frames[0], frames[1])
+            for lines in frames:
+                self.assertTrue(all(m._display_width(line.text) <= width for line in lines))
+                self.assertEqual([line.text for line in lines if line.heading], [line.text for line in frames[0] if line.heading])
+        state = m.ViewState(rankings=True)
+        m._handle_key(state, ord("e"), 20, [100, 100])
+        self.assertFalse(state.effects)
+        m._handle_key(state, ord("e"), 20, [100, 100])
+        self.assertTrue(state.effects)
 
     def test_empty_rankings_unknown_accounts_and_ties(self):
         self.assertIn("No running GPU allocations", m._ranking_lines(snapshot([]), 80, "alice")[0].text)
