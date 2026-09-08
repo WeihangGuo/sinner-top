@@ -91,6 +91,12 @@ including when there are more types than available number keys.
 Your rows use a colored background, or reverse video when colors are disabled.
 The interface honors `NO_COLOR`; use `--color always` to enable colors explicitly.
 
+Running jobs' remaining time is **green** at one hour or less, **yellow** above
+one hour through six hours, and **red** above six hours. Unknown remaining
+time is dimmed. Colors follow the live countdown, including when a job crosses
+a threshold between Slurm refreshes. Your own job rows keep their highlight;
+the time text uses the terminal background for contrast.
+
 ## Reading the display
 
 - **idle X/Y**: currently unallocated GPUs on schedulable nodes / all configured GPUs.

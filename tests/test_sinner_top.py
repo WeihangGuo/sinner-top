@@ -104,6 +104,41 @@ class SinnerTopChecks(unittest.TestCase):
         self.assertEqual(m._start_label("2026-09-04T11:00:00", NOW), "start overdue")
         self.assertLess(m._finish_key(job(left="10:00"), NOW), m._finish_key(job(left="4:00:00", count=8), NOW))
 
+    def test_remaining_time_colors_and_live_thresholds(self):
+        for seconds, color in ((0, "32"), (3600, "32"), (3601, "33"), (21600, "33"), (21601, "31"), (float("inf"), "2")):
+            self.assertEqual(m._duration_color(seconds), color)
+        self.assertEqual(m._remaining_color("30:00"), "32")
+        self.assertEqual(m._remaining_color("12:00:00"), "31")
+        snap = snapshot([job(left="12:00:00", end="2026-09-04T13:00:01")])
+        for now, color in ((NOW, "33"), (NOW + 1, "32")):
+            lines, _ = m._panel_lines(snap, m.RUNNING_STATES, "h200", 40, "alice", now)
+            times = [line for line in lines if line.remaining_seconds is not None]
+            self.assertEqual(len(times), 1)
+            self.assertEqual(m._duration_color(times[0].remaining_seconds), color)
+        lines, _ = m._panel_lines(snapshot([job(left="UNLIMITED")]), m.RUNNING_STATES, "h200", 40, "alice", NOW)
+        time_line = next(line for line in lines if line.remaining_seconds is not None)
+        self.assertIn("unknown", time_line.text)
+        self.assertEqual(m._duration_color(time_line.remaining_seconds), "2")
+        pending, _ = m._panel_lines(snapshot([job(state="PENDING")]), m.QUEUED_STATES, "h200", 40, "alice", NOW)
+        self.assertTrue(all(line.remaining_seconds is None for line in pending))
+
+    def test_time_colors_preserve_own_highlight_and_wrapping(self):
+        attrs = {"32": 301, "33": 302, "31": 303, "2": 304}
+        snap = snapshot([job(left="30:00"), job("42_2", left="3:00:00"), job("42_3", left="12:00:00")])
+        for width in (40, 80, 120):
+            lines, count = m._panel_lines(snap, m.RUNNING_STATES, "h200", (width - 1) // 2, "alice", NOW)
+            screen = Screen(60, width)
+            panels = [(lines, count), ([m.PanelLine("No pending jobs")], 0)]
+            m._draw_screen(screen, m.ViewState(), panels, snap, "alice", 5, NOW, "", False, curses.A_BOLD, curses.A_REVERSE, attrs)
+            overlays = [record for record in screen.writes if record[3] in attrs.values()]
+            self.assertEqual({record[3] for record in overlays}, {301, 302, 303})
+            for y, x, text, attr in overlays:
+                base = next(record for record in screen.writes if record[0] == y and record[1] == 0)
+                self.assertTrue(base[3] & curses.A_REVERSE)
+                self.assertGreater(x, 0)
+            m._draw_screen(screen, m.ViewState(), panels, snap, "alice", 5, NOW, "", False, curses.A_BOLD, curses.A_REVERSE)
+            self.assertFalse(any(record[3] in attrs.values() for record in screen.writes))
+
     def test_filtering_highlighting_and_all_rows_are_scrollable(self):
         jobs = [job(str(i), "alice", "24gb") for i in range(12)]
         jobs += [job("30", "bob", "24gb"), job("31", "alice", "h200")]

@@ -444,13 +444,16 @@ def _side_by_side(left: list[str], right: list[str], width: int) -> list[str]:
 
 
 def _remaining_color(value: str) -> str:
-    seconds = _remaining_seconds(value)
+    return _duration_color(_remaining_seconds(value))
+
+
+def _duration_color(seconds: float) -> str:
     if seconds <= 3600:
-        return "31"
+        return "32"
     if seconds <= 6 * 3600:
         return "33"
     if seconds < float("inf"):
-        return "32"
+        return "31"
     return "2"
 
 
@@ -669,6 +672,7 @@ class PanelLine:
     text: str
     own: bool = False
     heading: bool = False
+    remaining_seconds: float | None = None
 
 
 @dataclass
@@ -744,8 +748,14 @@ def _panel_lines(
     groups = _group_jobs(snapshot, states, gpu_type)
     job_count = sum(len(group[3]) for group in groups)
 
-    def append(text: str, own: bool = False, heading: bool = False) -> None:
-        lines.extend(PanelLine(part, own, heading) for part in _wrap_line(text, width))
+    def append(
+        text: str, own: bool = False, heading: bool = False,
+        remaining_seconds: float | None = None,
+    ) -> None:
+        lines.extend(
+            PanelLine(part, own, heading, remaining_seconds)
+            for part in _wrap_line(text, width)
+        )
 
     for rank, (_, user, total, jobs) in enumerate(groups, 1):
         if lines:
@@ -758,16 +768,17 @@ def _panel_lines(
         for index, (job, allocations, usage) in enumerate(shown):
             branch = "└─" if index == len(jobs) - 1 else "├─"
             append(f"  {branch} {job.name} [{job.job_id}]  {_usage_label(usage)}", own)
+            remaining_seconds = None
             if job.state.upper() in QUEUED_STATES:
                 timing = f"{_start_label(job.start, now)}  limit {_remaining_label(job.left)}"
             else:
                 end = _timestamp(job.end)
-                remaining = (
-                    _duration_label(max(0, end - now))
-                    if end < float("inf") else _remaining_label(job.left)
+                remaining_seconds = (
+                    max(0, end - now)
+                    if end < float("inf") else _remaining_seconds(job.left)
                 )
-                timing = f"end in {remaining}"
-            append(f"     {timing}", own)
+                timing = f"end in {_duration_label(remaining_seconds)}"
+            append(f"     {timing}", own, remaining_seconds=remaining_seconds)
             if show_ids and job.state.upper() in RUNNING_STATES:
                 append(f"     {_id_label(allocations)}", own)
         omitted = len(jobs) - len(shown)
@@ -859,6 +870,7 @@ def _draw_screen(
     loading: bool,
     title_attr: int,
     own_attr: int,
+    remaining_attrs: dict[str, int] | None = None,
 ) -> None:
     height, width = screen.getmaxyx()
     screen.erase()
@@ -892,6 +904,16 @@ def _draw_screen(
             if line.heading:
                 attr |= curses.A_BOLD
             _write(screen, row, starts[pane], line.text, widths[pane], attr)
+            if line.remaining_seconds is not None and remaining_attrs:
+                timing = line.text.lstrip()
+                indent = _display_width(line.text) - _display_width(timing)
+                # Keep the user's highlight in the row margins. Draw the time
+                # on the terminal background so green text stays readable.
+                _write(
+                    screen, row, starts[pane] + indent, timing,
+                    _display_width(timing),
+                    remaining_attrs[_duration_color(line.remaining_seconds)],
+                )
     for row in range(2, height - 3):
         _write(screen, row, left_width, "│", 1, curses.A_DIM)
     count = len(panels[state.pane][0])
@@ -924,6 +946,7 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
     screen.timeout(100)
     title_attr = curses.A_BOLD
     own_attr = curses.A_REVERSE
+    remaining_attrs: dict[str, int] = {}
     if use_color and curses.has_colors():
         curses.start_color()
         background = curses.COLOR_BLACK
@@ -936,6 +959,14 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
         curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
         title_attr |= curses.color_pair(1)
         own_attr = curses.color_pair(2)
+        for pair, code, foreground in (
+            (3, "31", curses.COLOR_RED),
+            (4, "33", curses.COLOR_YELLOW),
+            (5, "32", curses.COLOR_GREEN),
+        ):
+            curses.init_pair(pair, foreground, background)
+            remaining_attrs[code] = curses.A_BOLD | curses.color_pair(pair)
+        remaining_attrs["2"] = curses.A_DIM
     state = ViewState(gpu_type=args.gpu)
     loader = SnapshotLoader()
     snapshot: Snapshot | None = None
@@ -976,7 +1007,7 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
         state.clamp(counts, page_height)
         _draw_screen(
             screen, state, panels, snapshot, current_user, args.interval,
-            updated, error, loader.running, title_attr, own_attr,
+            updated, error, loader.running, title_attr, own_attr, remaining_attrs,
         )
         action = _handle_key(state, screen.getch(), page_height, counts)
         if action == "quit":
