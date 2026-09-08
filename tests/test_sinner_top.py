@@ -18,9 +18,9 @@ loader.exec_module(m)
 NOW = datetime(2026, 9, 4, 12).timestamp()
 
 
-def job(job_id="42_1", user="alice", gpu="h200", state="RUNNING", left="30:00", end="N/A", start="N/A", count=1):
+def job(job_id="42_1", user="alice", gpu="h200", state="RUNNING", left="30:00", end="N/A", start="N/A", count=1, account="unknown"):
     gres = f"gres/gpu:{gpu}:{count}" if gpu != "any" else f"gres/gpu:{count}"
-    return m.Job(job_id, user, "training", "node1", gres, left, end, state, start)
+    return m.Job(job_id, user, "training", "node1", gres, left, end, state, start, account)
 
 
 def snapshot(jobs):
@@ -177,11 +177,13 @@ class SinnerTopChecks(unittest.TestCase):
         state = m.ViewState(gpu_types=["h200", "h100", "24gb", "47gb", "any"])
         state.offsets["h200", 0] = 4
         visited = []
-        for _ in state.gpu_types:
-            visited.append(state.gpu_type)
+        for _ in range(len(state.gpu_types) + 1):
+            visited.append("rankings" if state.rankings else state.gpu_type)
             m._handle_key(state, ord("g"), 10, [100, 100])
-        self.assertEqual(visited, state.gpu_types)
+        self.assertEqual(visited, state.gpu_types + ["rankings"])
         self.assertEqual(state.offset(0), 4)
+        m._handle_key(state, ord("["), 10, [100, 100])
+        self.assertTrue(state.rankings)
         m._handle_key(state, ord("["), 10, [100, 100])
         self.assertEqual(state.gpu_type, "any")
         m._handle_key(state, ord("3"), 10, [100, 100])
@@ -199,7 +201,87 @@ class SinnerTopChecks(unittest.TestCase):
                 own_rows = [record for record in screen.writes if "alice (you)" in record[2]]
                 self.assertTrue(own_rows)
                 self.assertTrue(own_rows[0][3] & curses.A_REVERSE)
-                self.assertTrue(any(y == height - 1 and "[/]/g:GPU" in text for y, x, text, attr in screen.writes))
+                self.assertTrue(any(y == height - 1 and "[/]/g:view" in text for y, x, text, attr in screen.writes))
+
+    def test_account_field_parsing_and_collection(self):
+        legacy = "1|alice|train|node1|gres/gpu:h200:1|30:00|N/A|RUNNING"
+        self.assertEqual(m.parse_squeue(legacy)[0].account, "unknown")
+        self.assertEqual(m.parse_squeue(legacy + "|N/A")[0].account, "unknown")
+        self.assertEqual(m.parse_squeue(legacy + "|N/A|lab-a")[0].account, "lab-a")
+        with patch.object(m, "_run", side_effect=[legacy + "|N/A|lab-a", "", ""]) as run:
+            snap = m.collect_snapshot()
+        self.assertTrue(any("%a" in part for part in run.call_args_list[0].args[0]))
+        self.assertEqual(snap.jobs[0].account, "lab-a")
+
+    def test_account_totals_split_users_and_ignore_pending(self):
+        jobs = [
+            job("10_1", "alice", count=2, account="alpha"),
+            job("10_2", "alice", count=3, account="alpha"),
+            job("11", "bob", gpu="h100", count=4, account="alpha"),
+            job("12", "alice", gpu="47gb", count=8, account="beta"),
+            job("13", "carol", count=6, account="gamma", state="COMPLETING"),
+            job("14", "alice", count=100, account="beta", state="PENDING"),
+            replace(job("15", "alice", account="cpu-only"), gres="N/A"),
+        ]
+        ranks = m._account_rankings(snapshot(jobs))
+        self.assertEqual([row.account for row in ranks], ["alpha", "beta", "gamma"])
+        self.assertEqual(ranks[0].usage, {"h200": 5, "h100": 4})
+        self.assertEqual(ranks[0].users["alice"], {"h200": 5})
+        self.assertEqual(ranks[1].users["alice"], {"47gb": 8})
+        self.assertEqual(sum(sum(row.usage.values()) for row in ranks), 23)
+
+    def test_ranking_medals_highlighting_and_terminal_width(self):
+        jobs = [
+            job("1", "bob", count=4, account="alpha"),
+            job("2", "alice", count=3, account="alpha"),
+            job("3", "carol", count=2, account="alpha"),
+            job("4", "dave", count=1, account="alpha"),
+            job("5", "erin", count=8, account="beta"),
+            job("6", "frank", count=6, account="gamma"),
+            job("7", "grace", count=1, account="delta"),
+        ]
+        snap = snapshot(jobs)
+        lines = m._ranking_lines(snap, 120, "alice")
+        headings = [line for line in lines if line.heading]
+        self.assertEqual([line.text.split()[0] for line in headings], ["🥇", "🥈", "🥉", "4."])
+        self.assertTrue(headings[0].own)
+        self.assertTrue(any("🥈 alice (you)" in line.text and line.own for line in lines))
+        self.assertTrue(any("🥇 bob" in line.text and not line.own for line in lines))
+        self.assertTrue(any("🥉 carol" in line.text for line in lines))
+        self.assertTrue(any("4. dave" in line.text for line in lines))
+        for width, height in ((120, 30), (80, 24), (40, 12), (30, 8)):
+            lines = m._ranking_lines(snap, width, "alice")
+            self.assertTrue(all(m._display_width(line.text) <= width for line in lines))
+            screen = Screen(height, width)
+            state = m.ViewState(rankings=True)
+            m._draw_screen(screen, state, [], snap, "alice", 5, NOW, "", False, curses.A_BOLD, curses.A_REVERSE, ranking_lines=lines)
+            self.assertFalse(any(text == "│" for y, x, text, attr in screen.writes))
+            self.assertTrue(any(y == height - 1 and "0:RANK" in text for y, x, text, attr in screen.writes))
+
+    def test_ranking_navigation_keeps_separate_scroll_position(self):
+        state = m.ViewState(pane=1)
+        state.offsets["h200", 1] = 15
+        m._handle_key(state, ord("0"), 10, [100, 100])
+        self.assertTrue(state.rankings)
+        m._handle_key(state, curses.KEY_DOWN, 10, [40, 40])
+        self.assertEqual(state.ranking_offset, 5)
+        m._handle_key(state, curses.KEY_END, 10, [40, 40])
+        self.assertEqual(state.ranking_offset, 30)
+        m._handle_key(state, ord("0"), 10, [40, 40])
+        self.assertFalse(state.rankings)
+        self.assertEqual(state.offset(1), 15)
+        m._handle_key(state, ord("a"), 10, [100, 100])
+        self.assertEqual(state.offset(0), 30)
+        m._handle_key(state, curses.KEY_HOME, 10, [40, 40])
+        self.assertEqual(state.ranking_offset, 0)
+        m._handle_key(state, ord("1"), 10, [40, 40])
+        self.assertFalse(state.rankings)
+        self.assertEqual(state.gpu_type, "h100")
+
+    def test_empty_rankings_unknown_accounts_and_ties(self):
+        self.assertIn("No running GPU allocations", m._ranking_lines(snapshot([]), 80, "alice")[0].text)
+        jobs = [job("1", account="zeta"), job("2", account="alpha"), job("3", account="N/A")]
+        self.assertEqual([row.account for row in m._account_rankings(snapshot(jobs))], ["alpha", "unknown", "zeta"])
 
     def test_loader_failure_is_reported_and_can_retry(self):
         loader = m.SnapshotLoader()

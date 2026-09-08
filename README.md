@@ -7,6 +7,7 @@ A terminal GPU monitor for Slurm clusters, with running and pending jobs side by
 - Includes individual job-array tasks and highlights your own jobs.
 - Discovers GPU resource types from Slurm, starting with H200 when available.
 - Shows pending start estimates and independent scroll positions for each pane and GPU type.
+- Ranks accounts and their users by current GPU use, with medals for the top three.
 - Uses Python's standard library; no pip packages are needed.
 
 ## Install or update
@@ -78,15 +79,18 @@ All array tasks are available by scrolling in the interactive interface.
 | Page Down / Ctrl+D | Scroll one page down |
 | Home | Scroll to the top |
 | End / `G` | Scroll to the bottom |
-| `[` | Previous GPU type |
-| `]` / `g` | Next GPU type |
+| `[` | Previous GPU type or rankings view |
+| `]` / `g` | Next GPU type or rankings view |
 | Number keys shown in the footer | Select a GPU type directly |
+| `0` / `a` | Open account rankings; press again to return to the previous GPU view |
 | `r` | Refresh now |
 | `q` / Ctrl+C | Quit |
 
 When present, `1` selects H100 and `2` selects H200. Other discovered GPU types
 get additional number shortcuts. All types remain reachable with `[` and `]`,
 including when there are more types than available number keys.
+The final footer entry, `0:RANK`, opens the account ranking view; it also follows
+the last GPU type when cycling with `[` / `]` / `g`.
 
 Your rows use a colored background, or reverse video when colors are disabled.
 The interface honors `NO_COLOR`; use `--color always` to enable colors explicitly.
@@ -96,6 +100,25 @@ one hour through six hours, and **red** above six hours. Unknown remaining
 time is dimmed. Colors follow the live countdown, including when a job crosses
 a threshold between Slurm refreshes. Your own job rows keep their highlight;
 the time text uses the terminal background for contrast.
+
+## Account and user rankings
+
+Press `0` to see a full-width leaderboard of Slurm accounts. Each account lists
+its users underneath it. Both accounts and users within each account are sorted
+by the number of GPUs currently allocated, highest first. The first three in
+each ranking receive 🥇, 🥈, and 🥉; ties are ordered alphabetically.
+
+The ranking combines all GPU types and shows their counts separately beside
+each total. It counts each allocated GPU equally, including individual array
+tasks, and excludes pending requests. It measures current GPU occupancy, not
+historical GPU-hours, CPU use, or relative GPU performance. Account membership
+comes from each running job's Slurm account, so a user's usage is attributed
+separately when they run jobs under multiple accounts.
+
+Your user rows and accounts with your running jobs are highlighted. Scroll with
+Up/Down or `k`/`j` (five lines), Page Up/Down, or Home/End. The ranking has its
+own scroll position; returning to a GPU view restores that view's position.
+No extra Slurm queries are needed for the ranking.
 
 ## Reading the display
 

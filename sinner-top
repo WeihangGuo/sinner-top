@@ -7,9 +7,10 @@ available, plus their runtime limit. Array tasks are counted individually and
 displayed with their task IDs.
 
 In a terminal, use arrows or hjkl to choose a pane and scroll. Press [ or ] to
-cycle through all GPU types discovered from Slurm (g also advances), or use the
+cycle through GPU types and rankings (g also advances), or use the
 number keys shown in the footer. H200 is the default. Your jobs are highlighted.
-Press q to quit; use --once for a printable snapshot instead.
+Press 0 for account and user GPU-usage rankings, or q to quit. Use --once for a
+printable snapshot instead.
 
 ``squeue`` supplies the live job list and timing estimates. Slurm's compact GRES
 field only reports a GPU type and count, so this script enriches it with
@@ -66,6 +67,7 @@ class Job:
     end: str
     state: str
     start: str = "N/A"
+    account: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,13 @@ class Snapshot:
     total: dict[str, int]
     jobs: list[Job]
     allocations: dict[str, list[Allocation]]
+
+
+@dataclass(frozen=True)
+class AccountUsage:
+    account: str
+    usage: dict[str, int]
+    users: dict[str, dict[str, int]]
 
 
 class SlurmCommandError(RuntimeError):
@@ -114,7 +123,7 @@ def parse_squeue(output: str) -> list[Job]:
         if not line.strip():
             continue
         fields = line.split("|")
-        if len(fields) not in {8, 9}:
+        if len(fields) not in {8, 9, 10}:
             raise ValueError(f"unexpected squeue row: {line!r}")
         jobs.append(Job(*fields))
     return jobs
@@ -279,7 +288,7 @@ def collect_snapshot() -> Snapshot:
             "--array",
             "--noheader",
             "--states=RUNNING,COMPLETING,PENDING",
-            "--format=%i|%u|%j|%N|%b|%L|%e|%T|%S",
+            "--format=%i|%u|%j|%N|%b|%L|%e|%T|%S|%a",
         )
     )
     nodes = _run(("scontrol", "show", "nodes", "--oneliner"))
@@ -537,6 +546,26 @@ def _group_jobs(
     return user_rows
 
 
+def _account_rankings(snapshot: Snapshot) -> list[AccountUsage]:
+    grouped: dict[str, dict[str, dict[str, int]]] = {}
+    for _, user, _, jobs in _group_jobs(snapshot, RUNNING_STATES):
+        for job, _, usage in jobs:
+            account = job.account.strip()
+            if account in {"", "N/A", "(null)"}:
+                account = "unknown"
+            user_usage = grouped.setdefault(account, {}).setdefault(user, {})
+            for gpu, count in usage.items():
+                user_usage[gpu] = user_usage.get(gpu, 0) + count
+    rankings: list[AccountUsage] = []
+    for account, users in grouped.items():
+        total: dict[str, int] = {}
+        for usage in users.values():
+            for gpu, count in usage.items():
+                total[gpu] = total.get(gpu, 0) + count
+        rankings.append(AccountUsage(account, total, users))
+    return sorted(rankings, key=lambda row: (-sum(row.usage.values()), row.account))
+
+
 def _render_user_rows(
     lines: list[str],
     user_rows: list[
@@ -681,11 +710,20 @@ class ViewState:
     gpu_types: list[str] = field(default_factory=lambda: list(PREFERRED_GPU_TYPES))
     pane: int = 0
     offsets: dict[tuple[str, int], int] = field(default_factory=dict)
+    rankings: bool = False
+    ranking_offset: int = 0
 
     def offset(self, pane: int) -> int:
+        if self.rankings:
+            return self.ranking_offset
         return self.offsets.get((self.gpu_type, pane), 0)
 
     def clamp(self, counts: Sequence[int], page_height: int) -> None:
+        if self.rankings:
+            self.ranking_offset = min(
+                max(0, self.ranking_offset), max(0, counts[0] - page_height)
+            )
+            return
         for pane, count in enumerate(counts):
             self.offsets[self.gpu_type, pane] = min(
                 max(0, self.offset(pane)), max(0, count - page_height)
@@ -699,6 +737,11 @@ def _handle_key(
         return "quit"
     if key == ord("r"):
         return "refresh"
+    if key in (ord("0"), ord("a")):
+        state.rankings = not state.rankings
+        return ""
+    if state.rankings and key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), ord("\t")):
+        return ""
     if key in (curses.KEY_LEFT, ord("h")):
         state.pane = 0
     elif key in (curses.KEY_RIGHT, ord("l")):
@@ -707,11 +750,17 @@ def _handle_key(
         state.pane = 1 - state.pane
     elif key in (ord("["), ord("]"), ord("g")) or key in range(ord("1"), ord("9") + 1):
         if key in (ord("["), ord("]"), ord("g")):
-            index = state.gpu_types.index(state.gpu_type)
+            index = len(state.gpu_types) if state.rankings else state.gpu_types.index(state.gpu_type)
             step = -1 if key == ord("[") else 1
-            state.gpu_type = state.gpu_types[(index + step) % len(state.gpu_types)]
+            next_index = (index + step) % (len(state.gpu_types) + 1)
+            state.rankings = next_index == len(state.gpu_types)
+            if not state.rankings:
+                state.gpu_type = state.gpu_types[next_index]
         else:
-            state.gpu_type = _gpu_shortcuts(state.gpu_types).get(chr(key), state.gpu_type)
+            gpu = _gpu_shortcuts(state.gpu_types).get(chr(key))
+            if gpu is not None:
+                state.gpu_type = gpu
+                state.rankings = False
         # Restore this GPU's scroll positions after its rows have been rebuilt.
         return ""
     else:
@@ -728,7 +777,10 @@ def _handle_key(
             offset = 0
         elif key in (curses.KEY_END, ord("G")):
             offset = counts[state.pane]
-        state.offsets[state.gpu_type, state.pane] = offset
+        if state.rankings:
+            state.ranking_offset = offset
+        else:
+            state.offsets[state.gpu_type, state.pane] = offset
     state.clamp(counts, page_height)
     return ""
 
@@ -790,6 +842,35 @@ def _panel_lines(
     return lines, job_count
 
 
+def _ranking_lines(snapshot: Snapshot, width: int, current_user: str) -> list[PanelLine]:
+    lines: list[PanelLine] = []
+
+    def append(text: str, own: bool = False, heading: bool = False) -> None:
+        lines.extend(PanelLine(part, own, heading) for part in _wrap_line(text, width))
+
+    def rank_label(index: int) -> str:
+        return RANK_MEDALS[index] if index < len(RANK_MEDALS) else f"{index + 1}."
+
+    for index, row in enumerate(_account_rankings(snapshot)):
+        if lines:
+            append("")
+        append(
+            f"{rank_label(index)} {row.account}  {sum(row.usage.values())} GPUs  |  {_usage_label(row.usage)}",
+            current_user in row.users, True,
+        )
+        users = sorted(row.users.items(), key=lambda item: (-sum(item[1].values()), item[0]))
+        for user_index, (user, usage) in enumerate(users):
+            branch = "└─" if user_index == len(users) - 1 else "├─"
+            who = f"{user} (you)" if user == current_user else user
+            append(
+                f"  {branch} {rank_label(user_index)} {who}  {sum(usage.values())} GPUs  |  {_usage_label(usage)}",
+                user == current_user,
+            )
+    if not lines:
+        append("No running GPU allocations to rank")
+    return lines
+
+
 class SnapshotLoader:
     """Fetch Slurm data off the input thread so navigation stays responsive."""
 
@@ -835,11 +916,13 @@ def _clip_text(text: str, width: int) -> str:
 def _gpu_footer(state: ViewState, width: int) -> tuple[str, str]:
     keys = {gpu: key for key, gpu in _gpu_shortcuts(state.gpu_types).items()}
     labels = {gpu: f"{keys[gpu]}:{gpu.upper()}" if gpu in keys else gpu.upper() for gpu in state.gpu_types}
-    selected = labels[state.gpu_type]
-    footer = "  ".join(labels[gpu] for gpu in state.gpu_types) + "  [/]/g:GPU"
+    selected = "0:RANK" if state.rankings else labels[state.gpu_type]
+    footer = "  ".join(labels[gpu] for gpu in state.gpu_types) + "  0:RANK  [/]/g:view"
     if _display_width(footer) > width:
-        index = state.gpu_types.index(state.gpu_type) + 1
-        footer = f"{selected} {index}/{len(state.gpu_types)}  [/]/g:GPU"
+        footer = (
+            "0:RANK  0:back  [/]/g:view" if state.rankings
+            else f"{selected}  0:RANK  [/]/g:view"
+        )
     return footer, selected
 
 
@@ -871,12 +954,13 @@ def _draw_screen(
     title_attr: int,
     own_attr: int,
     remaining_attrs: dict[str, int] | None = None,
+    ranking_lines: Sequence[PanelLine] | None = None,
 ) -> None:
     height, width = screen.getmaxyx()
     screen.erase()
     if width < 30 or height < 8:
         _write(screen, 0, 0, "Resize to at least 30×8", width, curses.A_BOLD)
-        _write(screen, height - 1, 0, "[/]/g:GPU q:quit", width)
+        _write(screen, height - 1, 0, "0:RANK [/]/g:view q:quit", width)
         screen.refresh()
         return
     gpu = state.gpu_type
@@ -886,40 +970,51 @@ def _draw_screen(
     )
     if gpu == "any" and snapshot and gpu not in snapshot.total:
         inventory = "GPU type unspecified"
-    _write(screen, 0, 0, f"sinner-top  {gpu.upper()}  |  {inventory}", width, title_attr)
+    title = (
+        "sinner-top  ACCOUNT RANKINGS  |  all GPU types"
+        if state.rankings else f"sinner-top  {gpu.upper()}  |  {inventory}"
+    )
+    _write(screen, 0, 0, title, width, title_attr)
     updated_label = time.strftime("%H:%M:%S", time.localtime(updated)) if updated else "--:--:--"
     _write(screen, 1, 0, f"Updated {updated_label}  refresh {interval:g}s  |  you: {current_user} (highlighted)", width, curses.A_DIM)
     left_width = (width - 1) // 2
     widths = (left_width, width - left_width - 1)
     starts = (0, left_width + 1)
     page_height = height - 6
-    for pane, (lines, _) in enumerate(panels):
-        label = "RUNNING" if pane == 0 else "PENDING"
-        focused = state.pane == pane
+    if state.rankings:
+        layout = [("ACCOUNTS / USERS — GPUs in use, highest first", ranking_lines or [], 0, width)]
+    else:
+        layout = [
+            ("RUNNING" if pane == 0 else "PENDING", lines, starts[pane], widths[pane])
+            for pane, (lines, _) in enumerate(panels)
+        ]
+    for pane, (label, lines, start, pane_width) in enumerate(layout):
+        focused = state.rankings or state.pane == pane
         attr = title_attr | (curses.A_REVERSE if focused else 0)
-        _write(screen, 2, starts[pane], f"{'>' if focused else ' '} {label}", widths[pane], attr)
+        _write(screen, 2, start, f"{'>' if focused else ' '} {label}", pane_width, attr)
         visible = lines[state.offset(pane):state.offset(pane) + page_height]
         for row, line in enumerate(visible, 3):
             attr = own_attr if line.own else 0
             if line.heading:
                 attr |= curses.A_BOLD
-            _write(screen, row, starts[pane], line.text, widths[pane], attr)
+            _write(screen, row, start, line.text, pane_width, attr)
             if line.remaining_seconds is not None and remaining_attrs:
                 timing = line.text.lstrip()
                 indent = _display_width(line.text) - _display_width(timing)
                 # Keep the user's highlight in the row margins. Draw the time
                 # on the terminal background so green text stays readable.
                 _write(
-                    screen, row, starts[pane] + indent, timing,
+                    screen, row, start + indent, timing,
                     _display_width(timing),
                     remaining_attrs[_duration_color(line.remaining_seconds)],
                 )
-    for row in range(2, height - 3):
-        _write(screen, row, left_width, "│", 1, curses.A_DIM)
-    count = len(panels[state.pane][0])
+    if not state.rankings:
+        for row in range(2, height - 3):
+            _write(screen, row, left_width, "│", 1, curses.A_DIM)
+    count = len(ranking_lines or []) if state.rankings else len(panels[state.pane][0])
     first = state.offset(state.pane) + 1 if count else 0
     last = min(state.offset(state.pane) + page_height, count)
-    label = "Running" if state.pane == 0 else "Pending"
+    label = "Ranking" if state.rankings else "Running" if state.pane == 0 else "Pending"
     status = f"{label} lines {first}–{last}/{count}  |  PgUp/PgDn Home/End"
     if error:
         status = f"Slurm: {error}  (r: retry)"
@@ -927,8 +1022,10 @@ def _draw_screen(
         status += "  |  Refreshing…"
     _write(screen, height - 3, 0, status, width, curses.A_DIM)
     controls = "←/h →/l pane  ↑/k ↓/j 5 lines  r:refresh  q:quit"
+    if state.rankings:
+        controls = "↑/k ↓/j 5 lines  0:back  r:refresh  q:quit"
     if width < _display_width(controls):
-        controls = "h/l:pane j/k:5lines q:quit"
+        controls = "0:back j/k:5lines q:quit" if state.rankings else "h/l:pane j/k:5lines q:quit"
     _write(screen, height - 2, 0, controls, width, curses.A_DIM)
     footer, selected = _gpu_footer(state, width)
     _write(screen, height - 1, 0, footer, width)
@@ -975,6 +1072,7 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
     next_refresh = 0.0
     cache_key = None
     panels: list[tuple[list[PanelLine], int]] = []
+    ranking_lines: list[PanelLine] = []
     while True:
         result = loader.poll()
         if result is not None:
@@ -990,7 +1088,7 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
             next_refresh = time.monotonic() + args.interval
         height, width = screen.getmaxyx()
         now = time.time()
-        key = (id(snapshot), state.gpu_type, width, int(now))
+        key = (id(snapshot), state.gpu_type, state.rankings, width, int(now))
         if key != cache_key:
             left_width = max(2, (width - 1) // 2)
             right_width = max(2, width - left_width - 1)
@@ -1001,13 +1099,18 @@ def _interactive(screen, args: argparse.Namespace, use_color: bool, current_user
                 ) if snapshot else ([PanelLine("Loading Slurm jobs…")], 0)
                 for states, pane_width in ((RUNNING_STATES, left_width), (QUEUED_STATES, right_width))
             ]
+            if state.rankings:
+                ranking_lines = (
+                    _ranking_lines(snapshot, max(2, width), current_user)
+                    if snapshot else [PanelLine("Loading Slurm jobs…")]
+                )
             cache_key = key
         page_height = max(1, height - 6)
-        counts = [len(lines) for lines, _ in panels]
+        counts = [len(ranking_lines)] * 2 if state.rankings else [len(lines) for lines, _ in panels]
         state.clamp(counts, page_height)
         _draw_screen(
             screen, state, panels, snapshot, current_user, args.interval,
-            updated, error, loader.running, title_attr, own_attr, remaining_attrs,
+            updated, error, loader.running, title_attr, own_attr, remaining_attrs, ranking_lines,
         )
         action = _handle_key(state, screen.getch(), page_height, counts)
         if action == "quit":
