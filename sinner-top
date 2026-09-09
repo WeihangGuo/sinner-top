@@ -976,6 +976,7 @@ class PanelLine:
     flash: bool = False
     tints: tuple[tuple[int, int, int], ...] = ()  # character start, length, shade
     remaining_start: int | None = None  # only color the timing suffix, if given
+    cells: tuple[tuple[int, int, PanelLine], ...] = ()  # x, width, content in a grid row
 
 
 @dataclass
@@ -1178,8 +1179,8 @@ def _panel_lines(
     return lines, job_count
 
 
-def _node_lines(snapshot: Snapshot, width: int, current_user: str, now: float) -> list[PanelLine]:
-    """H200 node inventory and actual per-node job allocations."""
+def _node_cards(snapshot: Snapshot, widths: Sequence[int], current_user: str, now: float):
+    """One card per H200 node; retain separate countdowns for each allocation."""
     nodes = {node.name: node for node in snapshot.nodes if node.total.get("h200", 0)}
     grouped: dict[str, list[tuple[Job, list[Allocation]]]] = {name: [] for name in nodes}
     for job in snapshot.jobs:
@@ -1196,51 +1197,82 @@ def _node_lines(snapshot: Snapshot, width: int, current_user: str, now: float) -
         for name, allocations in local.items():
             grouped[name].append((job, allocations))
 
-    lines: list[PanelLine] = []
-
-    def append(text: str, own: bool = False, heading: bool = False, remaining: float | None = None):
-        lines.extend(PanelLine(part, own, heading, remaining) for part in _wrap_line(text, width))
-
     ordered = sorted(nodes.values(), key=lambda node: (
         not _node_is_schedulable(node.state), -node.idle("h200"), node.name,
     ))
-    for node in ordered:
-        if lines:
-            append("")
+    cards = []
+    for index, node in enumerate(ordered):
+        width = widths[index % len(widths)]
+        lines: list[PanelLine] = []
+
+        def append(text: str, own: bool = False, heading: bool = False, remaining: float | None = None):
+            lines.extend(PanelLine(part, own, heading, remaining) for part in _wrap_line(text, width))
+
         used = node.allocated.get("h200", 0)
-        append(f"{node.name}  |  free {node.free('h200')}/{node.total['h200']}  used {used}  |  {node.state}", heading=True)
+        append(f"free {node.free('h200')}/{node.total['h200']}  used {used}", heading=True)
         if not _node_is_schedulable(node.state):
-            append("  Unavailable for new jobs (node state)")
+            append("UNAVAILABLE", heading=True)
+            append(node.state)
         visible = 0
         for job, allocations in sorted(grouped[node.name], key=lambda row: _finish_key(row[0], now)):
             count = sum(allocation.count for allocation in allocations)
             visible += count
             ids = ",".join(allocation.indices for allocation in allocations)
             own = job.user == current_user
-            who = f"{job.user} (you)" if own else job.user
-            prefix = f"  GPU {ids} ({count})  {who} [{job.job_id}]"
+            prefix = f"{ids} {job.user}"
             end = _timestamp(job.end)
             remaining = max(0, end - now) if math.isfinite(end) else _remaining_seconds(job.left)
-            timing = f"end in {_duration_label(remaining)}"
+            timing = _duration_label(remaining).replace(" ", "")
             if job.state.upper() == "COMPLETING":
-                timing = "completing / releasing"
+                timing = "releasing"
                 remaining = None
-            available = width - _display_width(prefix) - _display_width(timing) - 4
-            if available >= 4:
-                text = prefix + "  " + _clip_text(job.name, available)
-                text += " " * (width - _display_width(text) - _display_width(timing))
+            available = width - _display_width(prefix) - _display_width(timing)
+            if available >= 1:
+                text = prefix + " " * available
                 lines.append(PanelLine(text + timing, own=own, remaining_seconds=remaining, remaining_start=len(text)))
             else:
-                append(f"{prefix}  {job.name}", own)
-                append(f"    {timing}", own, remaining=remaining)
+                append(prefix, own)
+                append(f"  {timing}", own, remaining=remaining)
         if visible < used:
-            append(f"  {used - visible} allocated GPU(s): job details unavailable")
+            append(f"{used - visible} used: user unknown")
         elif visible > used:
-            append("  Allocation totals changed during refresh; awaiting next snapshot")
+            append("Allocation changed; refreshing")
         elif used == 0:
-            append("  No allocated GPUs")
-    if not nodes:
-        append("No H200 nodes reported by Slurm")
+            append("No allocated GPUs")
+        cards.append((node.name, lines))
+    return cards
+
+
+def _node_lines(snapshot: Snapshot, width: int, current_user: str, now: float) -> list[PanelLine]:
+    """Arrange node cards in four columns, retaining each cell's highlighting."""
+    if width < 12:
+        return [PanelLine("Resize terminal")]
+    widths = [width // 4 + (column < width % 4) for column in range(4)]
+    cards = _node_cards(snapshot, [cell_width - 2 for cell_width in widths], current_user, now)
+    if not cards:
+        return [PanelLine(part) for part in _wrap_line("No H200 nodes reported by Slurm", width)]
+    lines: list[PanelLine] = []
+    for start in range(0, len(cards), 4):
+        row = cards[start:start + 4]
+        framed = []
+        for (name, content), cell_width in zip(row, widths):
+            # Keep long node names readable by wrapping them in the card body.
+            if _display_width(name) > cell_width - 2:
+                content = [PanelLine(part, heading=True) for part in _wrap_line(name, cell_width - 2)] + content
+                name = ""
+            top = "┌" + name + "─" * (cell_width - 2 - _display_width(name)) + "┐"
+            framed.append((top, content))
+        row_height = max(len(content) for _, content in framed)
+        lines.append(PanelLine("".join(top for top, _ in framed), heading=True))
+        for y in range(row_height):
+            text = ""
+            cells = []
+            for (_, content), cell_width in zip(framed, widths):
+                line = content[y] if y < len(content) else PanelLine("")
+                cells.append((_display_width(text) + 1, cell_width - 2, line))
+                text += "│" + line.text + " " * (cell_width - 2 - _display_width(line.text)) + "│"
+            lines.append(PanelLine(text, cells=tuple(cells)))
+        lines.append(PanelLine("".join("└" + "─" * (cell_width - 2) + "┘" for cell_width in widths[:len(row)])))
     return lines
 
 
@@ -1727,6 +1759,23 @@ def _write(screen, y: int, x: int, text: str, width: int, attr: int = 0) -> None
         pass
 
 
+def _draw_panel_line(screen, row, start, width, line, own_attr, remaining_attrs, podium_attrs=()):
+    attr = own_attr if line.own else 0
+    if not line.own and line.podium_rank is not None:
+        attr = podium_attrs[line.podium_rank] if podium_attrs else curses.A_BOLD
+    if line.heading:
+        attr |= curses.A_BOLD
+    _write(screen, row, start, line.text, width, attr)
+    if line.remaining_seconds is not None and remaining_attrs:
+        timing = line.text.lstrip() if line.remaining_start is None else line.text[line.remaining_start:]
+        indent = _display_width(line.text) - _display_width(timing)
+        # Keep the user highlight around the time; use a plain background for contrast.
+        _write(screen, row, start + indent, timing, _display_width(timing),
+               remaining_attrs[_duration_color(line.remaining_seconds)])
+    for x, cell_width, cell in line.cells:
+        _draw_panel_line(screen, row, start + x, cell_width, cell, own_attr, remaining_attrs, podium_attrs)
+
+
 def _draw_screen(
     screen,
     state: ViewState,
@@ -1787,7 +1836,7 @@ def _draw_screen(
     if state.single_panel:
         label = "ACCOUNTS / USERS — GPU HOURS" if state.view == "history" else "ACCOUNTS / USERS — GPUs IN USE"
         if state.view == "nodes":
-            label = "NODE / GPU / USER / JOB — time to Slurm limit"
+            label = "4-COLUMN GRID  |  GPU / USER / LEFT (Slurm limit)"
         if state.view == "history" and state.history_page == "rest":
             label = "RANK #4+ / USERS — GPU HOURS"
         layout = [(label, panels[0][0], 0, width)]
@@ -1802,22 +1851,7 @@ def _draw_screen(
         _write(screen, label_y, start, f"{'>' if focused else ' '} {label}", pane_width, attr)
         visible = lines[state.offset(pane):state.offset(pane) + page_height]
         for row, line in enumerate(visible, label_y + 1):
-            attr = own_attr if line.own else 0
-            if not line.own and line.podium_rank is not None:
-                attr = podium_attrs[line.podium_rank] if podium_attrs else curses.A_BOLD
-            if line.heading:
-                attr |= curses.A_BOLD
-            _write(screen, row, start, line.text, pane_width, attr)
-            if line.remaining_seconds is not None and remaining_attrs:
-                timing = line.text.lstrip() if line.remaining_start is None else line.text[line.remaining_start:]
-                indent = _display_width(line.text) - _display_width(timing)
-                # Keep the user's highlight in the row margins. Draw the time
-                # on the terminal background so green text stays readable.
-                _write(
-                    screen, row, start + indent, timing,
-                    _display_width(timing),
-                    remaining_attrs[_duration_color(line.remaining_seconds)],
-                )
+            _draw_panel_line(screen, row, start, pane_width, line, own_attr, remaining_attrs, podium_attrs)
     if not state.single_panel:
         for row in range(2, height - 3):
             _write(screen, row, left_width, "│", 1, curses.A_DIM)

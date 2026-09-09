@@ -123,11 +123,14 @@ the time text uses the terminal background for contrast.
 
 ## H200 nodes
 
-Press **`n`** to see each H200 node's free/total and allocated GPU counts, node
-state, and the jobs occupying its GPUs. Nodes with more schedulable free GPUs
-appear first. Each job shows its allocated GPU IDs and count **on that node**,
-user, job/array-task ID, name, and a colored countdown to its Slurm time limit.
-Jobs within a node are ordered by earliest end time, and your jobs stay highlighted.
+Press **`n`** to open a **four-column grid**, with one card per H200 node and as
+many rows as needed. Each card shows the node name and free/total and allocated
+GPU counts, followed by **GPU IDs, username, and time left**. Job names and IDs
+are omitted. Nodes with more schedulable free GPUs appear first, from left to
+right. Allocations within each card are ordered by earliest end time, and your
+rows stay highlighted. Separate jobs, including array tasks belonging to the
+same user, retain their own countdowns. Cards resize with the terminal; scroll
+vertically when the grid does not fit.
 The countdown is a runtime limit; applications may finish earlier. Completing
 jobs are labeled as releasing their resources.
 

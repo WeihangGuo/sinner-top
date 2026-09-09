@@ -231,10 +231,11 @@ class SinnerTopChecks(unittest.TestCase):
         self.assertEqual((snap.nodes[1].free("h200"), snap.nodes[1].idle("h200")), (6, 0))
         lines = m._node_lines(snap, 80, "alice", NOW)
         report = "\n".join(line.text for line in lines)
-        self.assertIn("n1  |  free 5/8  used 3", report)
-        self.assertIn("n2  |  free 6/8  used 2", report)
-        self.assertIn("Unavailable for new jobs", report)
-        self.assertIn("3 allocated GPU(s): job details unavailable", report)
+        cards = dict(m._node_cards(snap, [28] * 4, "alice", NOW))
+        self.assertIn("free 5/8  used 3", cards["n1"][0].text)
+        self.assertIn("free 6/8  used 2", cards["n2"][0].text)
+        self.assertIn("UNAVAILABLE", report)
+        self.assertIn("3 used: user unknown", "\n".join(line.text for line in cards["n1"]))
         self.assertNotIn("n3", report)
 
     def test_node_jobs_arrays_multi_host_and_local_gpu_counts(self):
@@ -249,17 +250,21 @@ class SinnerTopChecks(unittest.TestCase):
         snap = replace(snapshot(jobs), nodes=nodes, allocations=m.parse_job_allocations(details))
         lines = m._node_lines(snap, 120, "alice", NOW)
         report = "\n".join(line.text for line in lines)
-        self.assertEqual(report.count("[42_1]"), 3)
-        self.assertEqual(report.count("[42_2]"), 1)
-        self.assertNotIn("[43]", report)
+        self.assertEqual(report.count("alice"), 3)
+        self.assertEqual(report.count("bob"), 1)
+        self.assertNotIn("training", report)
+        self.assertNotIn("42_1", report)
+        self.assertNotIn("42_2", report)
         self.assertNotIn("unavailable", report)
         # Free capacity determines node ordering; jobs finish soonest first within a node.
         self.assertLess(report.index("n02"), report.index("n01"))
-        final_node = report[report.index("n01"):]
-        self.assertLess(final_node.index("[42_2]"), final_node.index("[42_1]"))
-        self.assertIn("GPU 0-1 (2)", final_node)
-        self.assertTrue(all(line.own for line in lines if "[42_1]" in line.text))
-        self.assertFalse(any(line.own for line in lines if "[42_2]" in line.text))
+        cards = dict(m._node_cards(snap, [28] * 4, "alice", NOW))
+        final_node = "\n".join(line.text for line in cards["n01"])
+        self.assertLess(final_node.index("bob"), final_node.index("alice"))
+        self.assertIn("0-1 alice", final_node)
+        cells = [cell for line in lines for _, _, cell in line.cells]
+        self.assertTrue(all(line.own for line in cells if "alice" in line.text))
+        self.assertFalse(any(line.own for line in cells if "bob" in line.text))
 
     def test_node_screen_countdowns_resize_and_unavailable_details(self):
         nodes = [m.NodeInventory("node1", "MIXED", {"h200": 8}, {"h200": 3})]
@@ -282,10 +287,32 @@ class SinnerTopChecks(unittest.TestCase):
                     self.assertNotIn("GPU", text)
         for now, color in ((NOW, "33"), (NOW + 1, "32")):
             lines = m._node_lines(snap, 120, "alice", now)
-            first = next(line for line in lines if "[42_1]" in line.text)
+            first = next(cell for line in lines for _, _, cell in line.cells if cell.text.startswith("0 alice"))
             self.assertEqual(m._duration_color(first.remaining_seconds), color)
-        self.assertIn("completing / releasing", "\n".join(line.text for line in lines))
+        self.assertIn("releasing", "\n".join(line.text for line in lines))
         self.assertIn("No H200 nodes", m._node_lines(snapshot([]), 80, "alice", NOW)[0].text)
+
+    def test_node_grid_four_columns_incomplete_row_and_cell_colors(self):
+        nodes = [m.NodeInventory(f"node{i}", "MIXED", {"h200": 8}, {"h200": 2}) for i in range(9)]
+        jobs = [job(str(i), user="alice" if i % 2 else "bob", left="00:30:00" if i % 2 else "12:00:00") for i in range(18)]
+        allocations = {row.job_id: [m.Allocation(f"node{i // 2}", "h200", 1, str(i % 2))] for i, row in enumerate(jobs)}
+        snap = replace(snapshot(jobs), nodes=nodes, allocations=allocations)
+        attrs = {"32": 301, "33": 302, "31": 303, "2": 304}
+        for width in (30, 40, 80, 81, 120, 160):
+            lines = m._node_lines(snap, width, "alice", NOW)
+            self.assertEqual([line.text.count("┌") for line in lines if "┌" in line.text], [4, 4, 1])
+            self.assertTrue(all(m._display_width(line.text) <= width for line in lines))
+            screen = Screen(len(lines) + 6, width)
+            m._draw_screen(screen, m.ViewState(view="nodes"), [(lines, 0)], snap, "alice", 5, NOW, "", False,
+                           curses.A_BOLD, curses.A_REVERSE, attrs)
+            colors = [text.strip() for y, x, text, attr in screen.writes if attr in attrs.values()]
+            self.assertGreaterEqual(len(colors), 18)  # narrow cells wrap long times
+            if width >= 80:
+                self.assertEqual(len(colors), 18)
+                self.assertEqual(colors.count("30m"), 9)
+                self.assertEqual(colors.count("12h00m"), 9)
+                own = [text for y, x, text, attr in screen.writes if "alice" in text and attr & curses.A_REVERSE]
+                self.assertEqual(len(own), 9)
 
     def test_node_navigation_preserves_job_and_node_positions(self):
         state = m.ViewState(gpu_type="h100", pane=1)
