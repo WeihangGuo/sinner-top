@@ -990,6 +990,7 @@ class ViewState:
     history_page: str = "podium"
     ranking_offsets: dict[str, int] = field(default_factory=dict)
     effects: bool = True
+    free_blink: bool = True
     memes: bool = True
     animation_elapsed: float = 0.0
     animation_tick: float | None = None
@@ -1052,6 +1053,9 @@ def _handle_key(
         return ""
     if key == ord("e") and state.view == "history":
         state.effects = not state.effects
+        return ""
+    if key == ord("e") and state.view == "nodes":
+        state.free_blink = not state.free_blink
         return ""
     if key == ord("m") and state.view == "history":
         state.memes = not state.memes
@@ -1781,10 +1785,12 @@ def _write(screen, y: int, x: int, text: str, width: int, attr: int = 0) -> None
         pass
 
 
-def _draw_panel_line(screen, row, start, width, line, own_attr, remaining_attrs, podium_attrs=()):
+def _draw_panel_line(screen, row, start, width, line, own_attr, remaining_attrs, podium_attrs=(), free_flash=False):
     attr = own_attr if line.own else 0
     if line.free_gpu:
         attr = remaining_attrs.get("32", curses.A_BOLD) if remaining_attrs else curses.A_BOLD
+        if free_flash:
+            attr |= curses.A_REVERSE
     if not line.own and line.podium_rank is not None:
         attr = podium_attrs[line.podium_rank] if podium_attrs else curses.A_BOLD
     if line.heading:
@@ -1797,7 +1803,7 @@ def _draw_panel_line(screen, row, start, width, line, own_attr, remaining_attrs,
         _write(screen, row, start + indent, timing, _display_width(timing),
                remaining_attrs[_duration_color(line.remaining_seconds)])
     for x, cell_width, cell in line.cells:
-        _draw_panel_line(screen, row, start + x, cell_width, cell, own_attr, remaining_attrs, podium_attrs)
+        _draw_panel_line(screen, row, start + x, cell_width, cell, own_attr, remaining_attrs, podium_attrs, free_flash)
 
 
 def _draw_screen(
@@ -1869,13 +1875,16 @@ def _draw_screen(
             (("RUNNING", "PENDING")[pane], lines, starts[pane], widths[pane])
             for pane, (lines, _) in enumerate(panels)
         ]
+    # Redraw the highlight ourselves: many tmux/terminal configurations ignore
+    # the terminal's native blink attribute. Keep FREE readable in both phases.
+    free_flash = state.view == "nodes" and state.free_blink and int(time.monotonic() / 0.6) % 2 == 0
     for pane, (label, lines, start, pane_width) in enumerate([] if podium else layout):
         focused = state.focused_pane == pane
         attr = title_attr | (curses.A_REVERSE if focused else 0)
         _write(screen, label_y, start, f"{'>' if focused else ' '} {label}", pane_width, attr)
         visible = lines[state.offset(pane):state.offset(pane) + page_height]
         for row, line in enumerate(visible, label_y + 1):
-            _draw_panel_line(screen, row, start, pane_width, line, own_attr, remaining_attrs, podium_attrs)
+            _draw_panel_line(screen, row, start, pane_width, line, own_attr, remaining_attrs, podium_attrs, free_flash)
     if not state.single_panel:
         for row in range(2, height - 3):
             _write(screen, row, left_width, "│", 1, curses.A_DIM)
@@ -1898,13 +1907,14 @@ def _draw_screen(
     if state.rankings:
         controls = "h:live l:total  ↑/k ↓/j 5 lines  0/t:back  r:refresh  q:quit"
     if state.view == "nodes":
-        controls = "↑/k ↓/j 5 lines  n:back  h:running l:pending  r:refresh  q:quit"
+        flash_action = "pause" if state.free_blink else "play"
+        controls = f"↑/k ↓/j 5 lines  e:{flash_action} flash  n:back  h:running l:pending  r:refresh  q:quit"
     if state.view == "history":
         effects = "pause" if state.effects else "play"
         controls = (f"h:live  e:{effects} FX  m:art  t:back  r:refresh  q:quit" if podium
                     else "↑/k ↓/j 5 lines  b:podium  h:live  t:back  r:refresh  q:quit")
     if width < _display_width(controls):
-        controls = {"nodes": "j/k:5 n:back r:refresh q:quit", "history": "j/k:5 e:FX m:art t:back q:quit", "live": "j/k:5 l:total 0:back q:quit"}.get(state.view, "h/l:pane j/k:5lines q:quit")
+        controls = {"nodes": "j/k:5 e:flash n:back q:quit", "history": "j/k:5 e:FX m:art t:back q:quit", "live": "j/k:5 l:total 0:back q:quit"}.get(state.view, "h/l:pane j/k:5lines q:quit")
     _write(screen, height - 2, 0, controls, width, curses.A_DIM)
     footer, selected = _gpu_footer(state, width)
     _write(screen, height - 1, 0, footer, width)

@@ -101,7 +101,7 @@ All array tasks are available by scrolling in the interactive interface.
 | `n` | Open H200 nodes; press again to return to the previous GPU view |
 | Enter | From the podium, open a full list of all accounts and users |
 | `b` / Backspace | From a historical list, return to the podium and replay its entrance |
-| `e` | Pause/resume the all-time podium animation |
+| `e` | Pause/resume FREE flashing on Nodes, or animation on the all-time podium |
 | `m` | Toggle full memes / compact faces on the all-time podium |
 | `r` | Refresh now, including history when Total is open |
 | `q` / Ctrl+C | Quit |
@@ -128,7 +128,11 @@ many rows as needed. Each card shows the node name and free/total and allocated
 GPU counts, followed by **GPU ID, username, and time left**. Job names and IDs
 are omitted. Nodes with more schedulable free GPUs appear first, from left to
 right. Every card displays all eight GPUs in device order, **0–7**, including
-idle devices marked **FREE** in green. A two- or four-GPU job appears on two or
+idle devices marked **FREE** in green. Free rows alternate between green text
+and a green background every 0.6 seconds to make available GPUs easy to spot.
+Press **`e`** to pause/resume flashing; paused rows stay green. This also works
+in tmux, with a reverse-video flash when colors are disabled. Blocked and
+unknown devices do not flash. A two- or four-GPU job appears on two or
 four separate rows, each showing its user and countdown. Your rows stay highlighted.
 Separate jobs, including array tasks belonging to the same user, retain their
 own countdowns. Cards resize with the terminal; scroll
