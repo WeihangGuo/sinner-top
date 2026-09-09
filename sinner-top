@@ -977,6 +977,7 @@ class PanelLine:
     tints: tuple[tuple[int, int, int], ...] = ()  # character start, length, shade
     remaining_start: int | None = None  # only color the timing suffix, if given
     cells: tuple[tuple[int, int, PanelLine], ...] = ()  # x, width, content in a grid row
+    free_gpu: bool = False
 
 
 @dataclass
@@ -1180,7 +1181,7 @@ def _panel_lines(
 
 
 def _node_cards(snapshot: Snapshot, widths: Sequence[int], current_user: str, now: float):
-    """One card per H200 node; retain separate countdowns for each allocation."""
+    """One card per H200 node, with one row per configured GPU device."""
     nodes = {node.name: node for node in snapshot.nodes if node.total.get("h200", 0)}
     grouped: dict[str, list[tuple[Job, list[Allocation]]]] = {name: [] for name in nodes}
     for job in snapshot.jobs:
@@ -1214,12 +1215,35 @@ def _node_cards(snapshot: Snapshot, widths: Sequence[int], current_user: str, no
             append("UNAVAILABLE", heading=True)
             append(node.state)
         visible = 0
-        for job, allocations in sorted(grouped[node.name], key=lambda row: _finish_key(row[0], now)):
-            count = sum(allocation.count for allocation in allocations)
-            visible += count
-            ids = ",".join(allocation.indices for allocation in allocations)
+        owners: dict[int, Job] = {}
+        conflicts: set[int] = set()
+        for job, allocations in grouped[node.name]:
+            for allocation in allocations:
+                visible += allocation.count
+                if not re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", allocation.indices):
+                    continue
+                for value in _expand_number_list(allocation.indices):
+                    gpu = int(value)
+                    if not 0 <= gpu < node.total["h200"]:
+                        continue
+                    if gpu in owners and owners[gpu].job_id != job.job_id:
+                        conflicts.add(gpu)
+                    owners[gpu] = job
+        # Counts alone cannot tell which unmapped devices are idle. Avoid
+        # marking them free when allocation details are missing or changing.
+        uncertain = visible != used or len(owners) != used or bool(conflicts)
+        for gpu in range(node.total["h200"]):
+            job = owners.get(gpu)
+            if job is None or gpu in conflicts:
+                free = job is None and not uncertain
+                label = "FREE" if free else "UNKNOWN"
+                if free and not _node_is_schedulable(node.state):
+                    label = "FREE (blocked)"
+                lines.extend(PanelLine(part, heading=free, free_gpu=free and node.idle("h200") > 0)
+                             for part in _wrap_line(f"{gpu} {label}", width))
+                continue
             own = job.user == current_user
-            prefix = f"{ids} {job.user}"
+            prefix = f"{gpu} {job.user}"
             end = _timestamp(job.end)
             remaining = max(0, end - now) if math.isfinite(end) else _remaining_seconds(job.left)
             timing = _duration_label(remaining).replace(" ", "")
@@ -1233,12 +1257,10 @@ def _node_cards(snapshot: Snapshot, widths: Sequence[int], current_user: str, no
             else:
                 append(prefix, own)
                 append(f"  {timing}", own, remaining=remaining)
-        if visible < used:
-            append(f"{used - visible} used: user unknown")
-        elif visible > used:
+        if len(owners) < used:
+            append(f"{used - len(owners)} used: user unknown")
+        elif uncertain:
             append("Allocation changed; refreshing")
-        elif used == 0:
-            append("No allocated GPUs")
         cards.append((node.name, lines))
     return cards
 
@@ -1761,6 +1783,8 @@ def _write(screen, y: int, x: int, text: str, width: int, attr: int = 0) -> None
 
 def _draw_panel_line(screen, row, start, width, line, own_attr, remaining_attrs, podium_attrs=()):
     attr = own_attr if line.own else 0
+    if line.free_gpu:
+        attr = remaining_attrs.get("32", curses.A_BOLD) if remaining_attrs else curses.A_BOLD
     if not line.own and line.podium_rank is not None:
         attr = podium_attrs[line.podium_rank] if podium_attrs else curses.A_BOLD
     if line.heading:

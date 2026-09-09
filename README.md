@@ -125,18 +125,21 @@ the time text uses the terminal background for contrast.
 
 Press **`n`** to open a **four-column grid**, with one card per H200 node and as
 many rows as needed. Each card shows the node name and free/total and allocated
-GPU counts, followed by **GPU IDs, username, and time left**. Job names and IDs
+GPU counts, followed by **GPU ID, username, and time left**. Job names and IDs
 are omitted. Nodes with more schedulable free GPUs appear first, from left to
-right. Allocations within each card are ordered by earliest end time, and your
-rows stay highlighted. Separate jobs, including array tasks belonging to the
-same user, retain their own countdowns. Cards resize with the terminal; scroll
+right. Every card displays all eight GPUs in device order, **0–7**, including
+idle devices marked **FREE** in green. A two- or four-GPU job appears on two or
+four separate rows, each showing its user and countdown. Your rows stay highlighted.
+Separate jobs, including array tasks belonging to the same user, retain their
+own countdowns. Cards resize with the terminal; scroll
 vertically when the grid does not fit.
 The countdown is a runtime limit; applications may finish earlier. Completing
 jobs are labeled as releasing their resources.
 
 Free GPUs on draining/down nodes are marked unavailable for new jobs. The header's
 `idle` count includes only schedulable nodes. Missing job details are reported
-against Slurm's node allocation totals; they are never counted as free GPUs.
+against Slurm's node allocation totals. Unmapped devices show **UNKNOWN** when
+their occupancy cannot be determined; they are never guessed to be free.
 The page refreshes with the regular job snapshot. Use Up/Down or `k`/`j` to scroll
 five lines, Page Up/Down for a page, and `r` to refresh. Press `n` to return, or
 `h`/`l` to return directly to Running/Pending. The default startup view stays H200 jobs.

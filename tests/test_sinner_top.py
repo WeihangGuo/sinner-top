@@ -250,18 +250,20 @@ class SinnerTopChecks(unittest.TestCase):
         snap = replace(snapshot(jobs), nodes=nodes, allocations=m.parse_job_allocations(details))
         lines = m._node_lines(snap, 120, "alice", NOW)
         report = "\n".join(line.text for line in lines)
-        self.assertEqual(report.count("alice"), 3)
+        self.assertEqual(report.count("alice"), 6)
         self.assertEqual(report.count("bob"), 1)
         self.assertNotIn("training", report)
         self.assertNotIn("42_1", report)
         self.assertNotIn("42_2", report)
         self.assertNotIn("unavailable", report)
-        # Free capacity determines node ordering; jobs finish soonest first within a node.
+        # Free capacity determines node ordering; GPUs stay in device order.
         self.assertLess(report.index("n02"), report.index("n01"))
         cards = dict(m._node_cards(snap, [28] * 4, "alice", NOW))
         final_node = "\n".join(line.text for line in cards["n01"])
-        self.assertLess(final_node.index("bob"), final_node.index("alice"))
-        self.assertIn("0-1 alice", final_node)
+        self.assertLess(final_node.index("alice"), final_node.index("bob"))
+        self.assertIn("0 alice", final_node)
+        self.assertIn("1 alice", final_node)
+        self.assertEqual(final_node.count("FREE"), 5)
         cells = [cell for line in lines for _, _, cell in line.cells]
         self.assertTrue(all(line.own for line in cells if "alice" in line.text))
         self.assertFalse(any(line.own for line in cells if "bob" in line.text))
@@ -305,7 +307,7 @@ class SinnerTopChecks(unittest.TestCase):
             screen = Screen(len(lines) + 6, width)
             m._draw_screen(screen, m.ViewState(view="nodes"), [(lines, 0)], snap, "alice", 5, NOW, "", False,
                            curses.A_BOLD, curses.A_REVERSE, attrs)
-            colors = [text.strip() for y, x, text, attr in screen.writes if attr in attrs.values()]
+            colors = [text.strip() for y, x, text, attr in screen.writes if attr in attrs.values() and "FREE" not in text]
             self.assertGreaterEqual(len(colors), 18)  # narrow cells wrap long times
             if width >= 80:
                 self.assertEqual(len(colors), 18)
@@ -313,6 +315,31 @@ class SinnerTopChecks(unittest.TestCase):
                 self.assertEqual(colors.count("12h00m"), 9)
                 own = [text for y, x, text, attr in screen.writes if "alice" in text and attr & curses.A_REVERSE]
                 self.assertEqual(len(own), 9)
+
+    def test_node_devices_split_multi_gpu_jobs_and_keep_all_empty_slots(self):
+        nodes = [m.NodeInventory("node1", "MIXED", {"h200": 8}, {"h200": 6}),
+                 m.NodeInventory("empty", "IDLE", {"h200": 8}, {})]
+        jobs = [job("42_1", user="alice", left="30:00"), job("42_2", user="alice", left="12:00:00")]
+        allocations = {"42_1": [m.Allocation("node1", "h200", 2, "1,3")],
+                       "42_2": [m.Allocation("node1", "h200", 4, "0,4-6")]}
+        snap = replace(snapshot(jobs), nodes=nodes, allocations=allocations)
+        cards = dict(m._node_cards(snap, [18] * 4, "alice", NOW))
+        for name in ("empty", "node1"):
+            rows = cards[name][1:]
+            self.assertEqual(len(rows), 8)
+            self.assertEqual([line.text.split()[0] for line in rows], list(map(str, range(8))))
+        occupied = cards["node1"][1:]
+        self.assertEqual([i for i, line in enumerate(occupied) if line.free_gpu], [2, 7])
+        self.assertEqual([line.remaining_seconds for line in occupied], [43200, 1800, None, 1800, 43200, 43200, 43200, None])
+        self.assertEqual(sum(line.own for line in occupied), 6)
+        self.assertTrue(all(line.free_gpu for line in cards["empty"][1:]))
+        missing = replace(snap, allocations={})
+        missing_rows = dict(m._node_cards(missing, [18] * 4, "alice", NOW))["node1"]
+        self.assertFalse(any(line.free_gpu or "FREE" in line.text for line in missing_rows))
+        self.assertEqual(sum("UNKNOWN" in line.text for line in missing_rows), 8)
+        unknown_ids = replace(snap, allocations={"42_1": [m.Allocation("node1", "h200", 2, "?")]})
+        rows = dict(m._node_cards(unknown_ids, [18] * 4, "alice", NOW))["node1"]
+        self.assertEqual(sum("UNKNOWN" in line.text for line in rows), 8)
 
     def test_node_navigation_preserves_job_and_node_positions(self):
         state = m.ViewState(gpu_type="h100", pane=1)
